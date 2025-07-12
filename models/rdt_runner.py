@@ -1,5 +1,3 @@
-# models/rdt_runner_flare.py
-
 import re
 import torch
 import torch.nn as nn
@@ -8,12 +6,12 @@ from diffusers.schedulers.scheduling_ddpm import DDPMScheduler
 from diffusers.schedulers.scheduling_dpmsolver_multistep import DPMSolverMultistepScheduler
 
 from models.hub_mixin import CompatiblePyTorchModelHubMixin
-from models.rdt.model_flare import RDTWithFLARE
+from models.rdt.model import RDTWithFLARE
 
 
 class RDTRunnerWithFLARE(nn.Module, CompatiblePyTorchModelHubMixin):
     """
-    FLARE增强的RDT Runner
+    完整集成的FLARE增强RDT Runner
     """
 
     def __init__(self,
@@ -32,7 +30,12 @@ class RDTRunnerWithFLARE(nn.Module, CompatiblePyTorchModelHubMixin):
                  # FLARE参数
                  num_future_tokens=32,
                  activation_layer=6,
-                 alignment_loss_weight=0.1):
+                 alignment_loss_weight=0.1,
+                 num_vl_fusion_layers=4,
+                 num_qformer_layers=6,
+                 alignment_temperature=0.07,
+                 vision_model_name="google/siglip-so400m-patch14-384",
+                 text_model_name="google/siglip-so400m-patch14-384"):
         super().__init__()
         
         self.alignment_loss_weight = alignment_loss_weight
@@ -52,6 +55,11 @@ class RDTRunnerWithFLARE(nn.Module, CompatiblePyTorchModelHubMixin):
             dtype=dtype,
             num_future_tokens=num_future_tokens,
             activation_layer=activation_layer,
+            num_vl_fusion_layers=num_vl_fusion_layers,
+            num_qformer_layers=num_qformer_layers,
+            alignment_temperature=alignment_temperature,
+            vision_model_name=vision_model_name,
+            text_model_name=text_model_name,
         )
 
         # 创建条件适配器
@@ -158,6 +166,7 @@ class RDTRunnerWithFLARE(nn.Module, CompatiblePyTorchModelHubMixin):
                                       img_cond,
                                       lang_mask=lang_attn_mask,
                                       future_vision_tokens=None,
+                                      text_instructions=None,
                                       return_alignment_loss=False)
 
             # 计算前一步动作: x_t -> x_t-1
@@ -170,7 +179,7 @@ class RDTRunnerWithFLARE(nn.Module, CompatiblePyTorchModelHubMixin):
         return noisy_action
 
     def compute_loss(self, lang_tokens, lang_attn_mask, img_tokens, state_tokens, action_gt, action_mask,
-                     ctrl_freqs, future_vision_tokens=None) -> tuple:
+                     ctrl_freqs, future_vision_tokens=None, text_instructions=None) -> tuple:
         """
         计算损失，包含FLARE对齐损失
         
@@ -203,13 +212,13 @@ class RDTRunnerWithFLARE(nn.Module, CompatiblePyTorchModelHubMixin):
             pred, alignment_loss = self.model(
                 state_action_traj, ctrl_freqs, timesteps, lang_cond, img_cond, 
                 lang_mask=lang_attn_mask, future_vision_tokens=adapted_future_vision,
-                return_alignment_loss=True
+                text_instructions=text_instructions, return_alignment_loss=True
             )
         else:
             pred = self.model(
                 state_action_traj, ctrl_freqs, timesteps, lang_cond, img_cond,
                 lang_mask=lang_attn_mask, future_vision_tokens=None,
-                return_alignment_loss=False
+                text_instructions=None, return_alignment_loss=False
             )
             alignment_loss = None
 
