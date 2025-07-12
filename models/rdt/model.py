@@ -1,3 +1,5 @@
+# models/rdt/model_flare.py
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -13,64 +15,144 @@ from rdt.blocks import (FinalLayer, RDTBlock, TimestepEmbedder, get_1d_sincos_po
                         get_multimodal_cond_pos_embed)
 
 
-class QFormerCompressor(nn.Module):
-    """Q-Former压缩器，用于将视觉token和语言token压缩到32个VL token"""
+class CrossModalFusion(nn.Module):
+    """跨模态融合模块，用于融合视觉和语言特征"""
     
-    def __init__(self, hidden_size, num_query_tokens=32, num_layers=2):
+    def __init__(self, hidden_size, num_heads=8, num_layers=2):
         super().__init__()
-        self.num_query_tokens = num_query_tokens
-        self.query_tokens = nn.Parameter(torch.randn(1, num_query_tokens, hidden_size))
+        self.hidden_size = hidden_size
         
-        # Q-Former层
-        self.layers = nn.ModuleList([
-            nn.TransformerDecoderLayer(
-                d_model=hidden_size,
-                nhead=16,
-                dim_feedforward=hidden_size * 4,
+        # 跨模态注意力层
+        self.cross_attention_layers = nn.ModuleList([
+            nn.MultiheadAttention(
+                embed_dim=hidden_size,
+                num_heads=num_heads,
                 dropout=0.1,
                 batch_first=True
             ) for _ in range(num_layers)
         ])
         
-        # 层归一化
-        self.layer_norm = nn.LayerNorm(hidden_size)
+        self.layer_norms = nn.ModuleList([
+            nn.LayerNorm(hidden_size) for _ in range(num_layers * 2)
+        ])
+        
+        # FFN
+        self.ffns = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(hidden_size, hidden_size * 4),
+                nn.GELU(),
+                nn.Dropout(0.1),
+                nn.Linear(hidden_size * 4, hidden_size),
+                nn.Dropout(0.1)
+            ) for _ in range(num_layers)
+        ])
         
     def forward(self, vision_tokens, lang_tokens, vision_mask=None, lang_mask=None):
         """
         Args:
-            vision_tokens: (B, V, D) 视觉token
-            lang_tokens: (B, L, D) 语言token  
-            vision_mask: (B, V) 视觉token掩码
-            lang_mask: (B, L) 语言token掩码
+            vision_tokens: (B, V, D) 视觉特征
+            lang_tokens: (B, L, D) 语言特征
+            vision_mask: (B, V) 视觉特征掩码
+            lang_mask: (B, L) 语言特征掩码
         Returns:
-            vl_tokens: (B, 32, D) 压缩后的VL token
+            fused_tokens: (B, V+L, D) 融合后的特征
         """
-        batch_size = vision_tokens.shape[0]
+        # 拼接视觉和语言特征
+        fused_tokens = torch.cat([vision_tokens, lang_tokens], dim=1)  # (B, V+L, D)
         
-        # 扩展query tokens
-        query_tokens = self.query_tokens.expand(batch_size, -1, -1)
-        
-        # 拼接视觉和语言token作为memory
-        memory = torch.cat([vision_tokens, lang_tokens], dim=1)  # (B, V+L, D)
-        
-        # 拼接掩码
+        # 创建联合掩码
         if vision_mask is not None and lang_mask is not None:
-            memory_mask = torch.cat([vision_mask, lang_mask], dim=1)  # (B, V+L)
+            joint_mask = torch.cat([vision_mask, lang_mask], dim=1)  # (B, V+L)
         else:
-            memory_mask = None
+            joint_mask = None
             
-        # 通过Q-Former层
-        output = query_tokens
-        for layer in self.layers:
-            output = layer(output, memory, memory_key_padding_mask=memory_mask)
+        # 通过跨模态注意力层
+        for i, (cross_attn, ln1, ln2, ffn) in enumerate(
+            zip(self.cross_attention_layers, self.layer_norms[::2], self.layer_norms[1::2], self.ffns)
+        ):
+            # Self-attention with cross-modal interaction
+            residual = fused_tokens
+            fused_tokens = ln1(fused_tokens)
             
-        output = self.layer_norm(output)
-        return output
+            attn_out, _ = cross_attn(
+                fused_tokens, fused_tokens, fused_tokens,
+                key_padding_mask=joint_mask if joint_mask is not None else None
+            )
+            fused_tokens = residual + attn_out
+            
+            # FFN
+            residual = fused_tokens
+            fused_tokens = ln2(fused_tokens)
+            fused_tokens = residual + ffn(fused_tokens)
+            
+        return fused_tokens
+
+
+class FutureObsPredictor(nn.Module):
+    """未来观测预测模块"""
+    
+    def __init__(self, hidden_size, num_future_tokens=32):
+        super().__init__()
+        self.num_future_tokens = num_future_tokens
+        
+        # 压缩网络：将融合特征压缩到未来观测token
+        self.compressor = nn.Sequential(
+            nn.Linear(hidden_size, hidden_size * 2),
+            nn.GELU(),
+            nn.Dropout(0.1),
+            nn.Linear(hidden_size * 2, hidden_size),
+            nn.LayerNorm(hidden_size)
+        )
+        
+        # 学习到的查询向量
+        self.query_tokens = nn.Parameter(torch.randn(1, num_future_tokens, hidden_size))
+        
+        # 注意力池化
+        self.attention_pool = nn.MultiheadAttention(
+            embed_dim=hidden_size,
+            num_heads=8,
+            dropout=0.1,
+            batch_first=True
+        )
+        
+        # 最终投影
+        self.final_proj = nn.Sequential(
+            nn.Linear(hidden_size, hidden_size),
+            nn.GELU(),
+            nn.Linear(hidden_size, hidden_size)
+        )
+        
+    def forward(self, fused_features, feature_mask=None):
+        """
+        Args:
+            fused_features: (B, N, D) 融合后的特征
+            feature_mask: (B, N) 特征掩码
+        Returns:
+            future_obs_tokens: (B, num_future_tokens, D) 预测的未来观测token
+        """
+        batch_size = fused_features.shape[0]
+        
+        # 压缩特征
+        compressed_features = self.compressor(fused_features)  # (B, N, D)
+        
+        # 扩展查询token
+        query_tokens = self.query_tokens.expand(batch_size, -1, -1)  # (B, num_future_tokens, D)
+        
+        # 注意力池化：用查询token从压缩特征中提取信息
+        future_obs_tokens, _ = self.attention_pool(
+            query_tokens, compressed_features, compressed_features,
+            key_padding_mask=feature_mask if feature_mask is not None else None
+        )
+        
+        # 最终投影
+        future_obs_tokens = self.final_proj(future_obs_tokens)
+        
+        return future_obs_tokens
 
 
 class RDTWithFLARE(nn.Module):
     """
-    FLARE增强的RDT模型，添加了未来观测token和对齐损失
+    FLARE增强的RDT模型
     """
 
     def __init__(self,
@@ -85,8 +167,8 @@ class RDTWithFLARE(nn.Module):
                  img_pos_embed_config=None,
                  dtype=torch.bfloat16,
                  # FLARE相关参数
-                 num_future_tokens=32,  # 未来观测token数量
-                 activation_layer=6):   # 激活层索引
+                 num_future_tokens=32,
+                 activation_layer=6):
         super().__init__()
         self.horizon = horizon
         self.hidden_size = hidden_size
@@ -103,21 +185,26 @@ class RDTWithFLARE(nn.Module):
         self.t_embedder = TimestepEmbedder(hidden_size, dtype=dtype)
         self.freq_embedder = TimestepEmbedder(hidden_size, dtype=dtype)
 
-        # 修改位置编码以包含未来观测token
-        # [timestep; state; action; future_obs]
+        # 位置编码：[timestep; state; action; future_obs]
         self.x_pos_embed = nn.Parameter(torch.zeros(1, horizon + 3 + num_future_tokens, hidden_size))
         
-        # Language conditions
+        # 条件位置编码
         self.lang_cond_pos_embed = nn.Parameter(torch.zeros(1, max_lang_cond_len, hidden_size))
-        # Image conditions
         self.img_cond_pos_embed = nn.Parameter(torch.zeros(1, img_cond_len, hidden_size))
 
+        # Transformer blocks
         self.blocks = nn.ModuleList([RDTBlock(hidden_size, num_heads) for _ in range(depth)])
         self.final_layer = FinalLayer(hidden_size, output_dim)
         
-        # FLARE相关组件
-        # Q-Former压缩器，用于压缩视觉和语言token
-        self.qformer_compressor = QFormerCompressor(hidden_size, num_future_tokens)
+        # FLARE组件
+        # 跨模态融合模块
+        self.cross_modal_fusion = CrossModalFusion(hidden_size)
+        
+        # 未来观测预测器
+        self.future_obs_predictor = FutureObsPredictor(hidden_size, num_future_tokens)
+        
+        # 未来观测token初始化
+        self.future_obs_tokens = nn.Parameter(torch.randn(1, num_future_tokens, hidden_size))
         
         # 未来观测token的MLP处理器
         self.future_obs_mlp = nn.Sequential(
@@ -127,13 +214,10 @@ class RDTWithFLARE(nn.Module):
             nn.Dropout(0.1)
         )
         
-        # 初始化未来观测token
-        self.future_obs_tokens = nn.Parameter(torch.randn(1, num_future_tokens, hidden_size))
-        
         self.initialize_weights()
 
     def initialize_weights(self):
-        # Initialize transformer layers:
+        # 初始化transformer层
         def _basic_init(module):
             if isinstance(module, nn.Linear):
                 torch.nn.init.xavier_uniform_(module.weight)
@@ -142,17 +226,18 @@ class RDTWithFLARE(nn.Module):
 
         self.apply(_basic_init)
 
-        # Initialize pos_embed by sin-cos embedding - 修改以包含未来观测token
+        # 初始化位置编码
         x_pos_embed = get_multimodal_cond_pos_embed(embed_dim=self.hidden_size,
                                                     mm_cond_lens=OrderedDict([
                                                         ('timestep', 1),
                                                         ('ctrl_freq', 1),
                                                         ('state', 1),
                                                         ('action', self.horizon),
-                                                        ('future_obs', self.num_future_tokens),  # 新增
+                                                        ('future_obs', self.num_future_tokens),
                                                     ]))
         self.x_pos_embed.data.copy_(torch.from_numpy(x_pos_embed).float().unsqueeze(0))
 
+        # 语言位置编码
         if self.lang_pos_embed_config is None:
             lang_cond_pos_embed = get_1d_sincos_pos_embed_from_grid(self.hidden_size,
                                                                     torch.arange(self.max_lang_cond_len))
@@ -162,6 +247,7 @@ class RDTWithFLARE(nn.Module):
                                                                 embed_modality=False)
         self.lang_cond_pos_embed.data.copy_(torch.from_numpy(lang_cond_pos_embed).float().unsqueeze(0))
 
+        # 图像位置编码
         if self.img_pos_embed_config is None:
             img_cond_pos_embed = get_1d_sincos_pos_embed_from_grid(self.hidden_size, torch.arange(self.img_cond_len))
         else:
@@ -170,113 +256,118 @@ class RDTWithFLARE(nn.Module):
                                                                embed_modality=False)
         self.img_cond_pos_embed.data.copy_(torch.from_numpy(img_cond_pos_embed).float().unsqueeze(0))
 
-        # Initialize timestep and control freq embedding MLP
+        # 初始化timestep和freq embedding
         nn.init.normal_(self.t_embedder.mlp[0].weight, std=0.02)
         nn.init.normal_(self.t_embedder.mlp[2].weight, std=0.02)
         nn.init.normal_(self.freq_embedder.mlp[0].weight, std=0.02)
         nn.init.normal_(self.freq_embedder.mlp[2].weight, std=0.02)
 
-        # Initialize the final layer: zero-out the final linear layer
+        # 初始化最终层
         nn.init.constant_(self.final_layer.ffn_final.fc2.weight, 0)
         nn.init.constant_(self.final_layer.ffn_final.fc2.bias, 0)
         
-        # 初始化FLARE相关组件
+        # 初始化FLARE组件
         nn.init.normal_(self.future_obs_tokens, std=0.02)
 
-        # Move all the params to given data type:
+        # 移动到指定数据类型
         self.to(self.dtype)
 
-    def compute_alignment_loss(self, future_obs_tokens, vl_tokens, margin=0.2):
+    def compute_alignment_loss(self, pred_future_tokens, target_future_tokens, temperature=0.07):
         """
-        计算未来观测token和VL token之间的对齐损失
-        使用论文中提到的对比学习损失
+        计算对齐损失，使用对比学习
+        
+        Args:
+            pred_future_tokens: (B, M, D) 预测的未来观测token
+            target_future_tokens: (B, M, D) 目标未来观测token
+            temperature: 温度参数
         """
-        # 归一化特征
-        future_obs_norm = F.normalize(future_obs_tokens, p=2, dim=-1)  # (B, 32, D)
-        vl_norm = F.normalize(vl_tokens, p=2, dim=-1)  # (B, 32, D)
+        # L2归一化
+        pred_norm = F.normalize(pred_future_tokens, p=2, dim=-1)  # (B, M, D)
+        target_norm = F.normalize(target_future_tokens, p=2, dim=-1)  # (B, M, D)
         
-        # 计算相似度矩阵
-        similarity = torch.bmm(future_obs_norm, vl_norm.transpose(1, 2))  # (B, 32, 32)
+        batch_size, num_tokens, hidden_dim = pred_norm.shape
         
-        # 对角线元素是正样本相似度
-        positive_sim = torch.diagonal(similarity, dim1=1, dim2=2)  # (B, 32)
+        # 计算相似度矩阵 (B, M, M)
+        similarity = torch.bmm(pred_norm, target_norm.transpose(1, 2)) / temperature
+        
+        # 对角线元素是正样本对
+        labels = torch.arange(num_tokens, device=similarity.device).unsqueeze(0).expand(batch_size, -1)
         
         # 计算对比损失
-        # 对于每个查询，其他所有位置都是负样本
-        batch_size, seq_len = positive_sim.shape
+        loss = F.cross_entropy(similarity.view(-1, num_tokens), labels.view(-1))
         
-        # 创建掩码，排除对角线元素
-        mask = torch.eye(seq_len, device=similarity.device).unsqueeze(0).expand(batch_size, -1, -1)
-        negative_sim = similarity.masked_fill(mask.bool(), float('-inf'))
-        
-        # 计算InfoNCE损失
-        logits = torch.cat([positive_sim.unsqueeze(-1), negative_sim.flatten(2)], dim=-1)  # (B, 32, 1+31*32)
-        labels = torch.zeros(batch_size, seq_len, dtype=torch.long, device=logits.device)
-        
-        alignment_loss = F.cross_entropy(logits.view(-1, logits.size(-1)), labels.view(-1))
-        
-        return alignment_loss
+        return loss
 
     def forward(self, x, freq, t, lang_c, img_c, lang_mask=None, img_mask=None, 
                 future_vision_tokens=None, return_alignment_loss=False):
         """
-        Forward pass of RDT with FLARE.
+        Forward pass
         
-        新增参数:
-            future_vision_tokens: (B, V_future, D) 未来观测的视觉token
+        Args:
+            x: (B, T, D) 状态和动作序列
+            freq: (B,) 控制频率
+            t: (B,) 时间步
+            lang_c: (B, L, D) 语言条件
+            img_c: (B, I, D) 图像条件
+            lang_mask: (B, L) 语言掩码
+            img_mask: (B, I) 图像掩码
+            future_vision_tokens: (B, V, D) 未来观测的视觉token
             return_alignment_loss: 是否返回对齐损失
         """
         batch_size = x.shape[0]
         
-        t = self.t_embedder(t).unsqueeze(1)  # (B, 1, D) or (1, 1, D)
+        # 编码时间步和频率
+        t = self.t_embedder(t).unsqueeze(1)  # (B, 1, D)
         freq = self.freq_embedder(freq).unsqueeze(1)  # (B, 1, D)
         
         # 初始化未来观测token
-        future_obs_tokens = self.future_obs_tokens.expand(batch_size, -1, -1)  # (B, 32, D)
+        future_obs_tokens = self.future_obs_tokens.expand(batch_size, -1, -1)  # (B, M, D)
         future_obs_tokens = self.future_obs_mlp(future_obs_tokens)
         
-        # Append timestep and future obs tokens to the input tokens
+        # 扩展时间步到batch
         if t.shape[0] == 1:
-            t = t.expand(x.shape[0], -1, -1)
+            t = t.expand(batch_size, -1, -1)
         
         # 拼接所有token: [timestep, freq, state+action, future_obs]
-        x = torch.cat([t, freq, x, future_obs_tokens], dim=1)  # (B, T+3+32, D)
+        x = torch.cat([t, freq, x, future_obs_tokens], dim=1)  # (B, T+3+M, D)
 
-        # Add multimodal position embeddings
+        # 添加位置编码
         x = x + self.x_pos_embed
         lang_c = lang_c + self.lang_cond_pos_embed[:, :lang_c.shape[1]]
         img_c = img_c + self.img_cond_pos_embed
 
-        # 如果提供了未来观测的视觉token，计算VL token用于对齐损失
-        alignment_loss = None
+        # 如果提供了未来观测，计算目标token用于对齐损失
+        target_future_tokens = None
         if future_vision_tokens is not None and return_alignment_loss:
-            # 使用Q-Former压缩视觉和语言token
-            vl_tokens = self.qformer_compressor(
+            # 跨模态融合
+            fused_features = self.cross_modal_fusion(
                 future_vision_tokens, lang_c, 
                 vision_mask=None, lang_mask=lang_mask
-            )  # (B, 32, D)
+            )  # (B, V+L, D)
             
-            # 提取第activation_layer层的未来观测token用于计算对齐损失
-            future_tokens_for_alignment = x[:, -(self.num_future_tokens):]  # (B, 32, D)
+            # 生成目标未来观测token
+            target_future_tokens = self.future_obs_predictor(fused_features)  # (B, M, D)
 
-        # Forward pass through transformer blocks
+        # 通过transformer blocks
         conds = [lang_c, img_c]
         masks = [lang_mask, img_mask]
+        alignment_loss = None
         
         for i, block in enumerate(self.blocks):
             c, mask = conds[i % 2], masks[i % 2]
-            x = block(x, c, mask)  # (B, T+3+32, D)
+            x = block(x, c, mask)  # (B, T+3+M, D)
             
-            # 在第activation_layer层激活未来观测token并计算对齐损失
-            if i == self.activation_layer and future_vision_tokens is not None and return_alignment_loss:
-                current_future_tokens = x[:, -(self.num_future_tokens):]  # (B, 32, D)
-                alignment_loss = self.compute_alignment_loss(current_future_tokens, vl_tokens)
+            # 在指定层计算对齐损失
+            if (i == self.activation_layer and target_future_tokens is not None and return_alignment_loss):
+                # 提取当前的未来观测token
+                current_future_tokens = x[:, -(self.num_future_tokens):]  # (B, M, D)
+                alignment_loss = self.compute_alignment_loss(current_future_tokens, target_future_tokens)
 
         # 最终层处理
-        x = self.final_layer(x)  # (B, T+3+32, out_channels)
+        x = self.final_layer(x)  # (B, T+3+M, out_channels)
 
-        # 只保留动作token，排除未来观测token
-        action_tokens = x[:, 2:2+self.horizon]  # 跳过timestep和freq，取horizon个动作token
+        # 只返回动作token，去除时间步、频率和未来观测token
+        action_tokens = x[:, 2:2+self.horizon]  # (B, horizon, out_channels)
         
         if return_alignment_loss:
             return action_tokens, alignment_loss

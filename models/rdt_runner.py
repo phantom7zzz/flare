@@ -1,23 +1,20 @@
-import re, sys, os
-from pathlib import Path
+# models/rdt_runner_flare.py
+
+import re
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from diffusers.schedulers.scheduling_ddpm import DDPMScheduler
 from diffusers.schedulers.scheduling_dpmsolver_multistep import DPMSolverMultistepScheduler
 
-from pathlib import Path
-# get current workspace
-current_file = Path(__file__)
-sys.path.append(os.path.join(current_file.parent))
-from hub_mixin import CompatiblePyTorchModelHubMixin
-# 修改导入以使用FLARE版本的RDT
-from rdt.model import RDTWithFLARE
+from models.hub_mixin import CompatiblePyTorchModelHubMixin
+from models.rdt.model_flare import RDTWithFLARE
 
 
-class RDTRunnerWithFLARE(nn.Module,
-                         CompatiblePyTorchModelHubMixin,
-                         repo_url="https://huggingface.co/robotics-diffusion-transformer/rdt-1b"):
+class RDTRunnerWithFLARE(nn.Module, CompatiblePyTorchModelHubMixin):
+    """
+    FLARE增强的RDT Runner
+    """
 
     def __init__(self,
                  *,
@@ -32,16 +29,15 @@ class RDTRunnerWithFLARE(nn.Module,
                  lang_pos_embed_config=None,
                  img_pos_embed_config=None,
                  dtype=torch.bfloat16,
-                 # FLARE相关参数
+                 # FLARE参数
                  num_future_tokens=32,
                  activation_layer=6,
                  alignment_loss_weight=0.1):
-        super(RDTRunnerWithFLARE, self).__init__()
+        super().__init__()
         
-        # FLARE相关属性
         self.alignment_loss_weight = alignment_loss_weight
         
-        # Create diffusion model with FLARE
+        # 创建FLARE增强的扩散模型
         hidden_size = config['rdt']['hidden_size']
         self.model = RDTWithFLARE(
             output_dim=action_dim,
@@ -54,11 +50,11 @@ class RDTRunnerWithFLARE(nn.Module,
             lang_pos_embed_config=lang_pos_embed_config,
             img_pos_embed_config=img_pos_embed_config,
             dtype=dtype,
-            num_future_tokens=num_future_tokens,  # 新增
-            activation_layer=activation_layer,    # 新增
+            num_future_tokens=num_future_tokens,
+            activation_layer=activation_layer,
         )
 
-        # Create adapters for various conditional inputs (保持不变)
+        # 创建条件适配器
         self.lang_adaptor = self.build_condition_adapter(config['lang_adaptor'],
                                                          in_features=lang_token_dim,
                                                          out_features=hidden_size)
@@ -70,13 +66,13 @@ class RDTRunnerWithFLARE(nn.Module,
             in_features=state_token_dim * 2,
             out_features=hidden_size)
 
-        # 新增：未来观测视觉token的适配器
+        # FLARE: 未来观测视觉token适配器
         self.future_vision_adaptor = self.build_condition_adapter(
             config.get('future_vision_adaptor', 'linear'),
-            in_features=img_token_dim,  # 与普通图像token相同
+            in_features=img_token_dim,
             out_features=hidden_size)
 
-        # Create the noise scheduler (保持不变)
+        # 噪声调度器
         noise_scheduler_config = config['noise_scheduler']
         self.noise_scheduler = DDPMScheduler(
             num_train_timesteps=noise_scheduler_config['num_train_timesteps'],
@@ -97,15 +93,15 @@ class RDTRunnerWithFLARE(nn.Module,
         self.pred_horizon = pred_horizon
         self.action_dim = action_dim
 
-        print("Diffusion params: %e" %
+        print("FLARE Diffusion params: %e" %
               sum([p.numel() for p in self.model.parameters()] + 
                   [p.numel() for p in self.lang_adaptor.parameters()] +
                   [p.numel() for p in self.img_adaptor.parameters()] + 
                   [p.numel() for p in self.state_adaptor.parameters()] +
-                  [p.numel() for p in self.future_vision_adaptor.parameters()]))  # 新增
+                  [p.numel() for p in self.future_vision_adaptor.parameters()]))
 
     def build_condition_adapter(self, projector_type, in_features, out_features):
-        # 保持原有实现不变
+        """构建条件适配器"""
         projector = None
         if projector_type == 'linear':
             projector = nn.Linear(in_features, out_features)
@@ -125,9 +121,7 @@ class RDTRunnerWithFLARE(nn.Module,
         return projector
 
     def adapt_conditions(self, lang_tokens, img_tokens, state_tokens, future_vision_tokens=None):
-        '''
-        修改以支持未来观测token的适配
-        '''
+        """适配条件输入"""
         adapted_lang = self.lang_adaptor(lang_tokens)
         adapted_img = self.img_adaptor(img_tokens)
         adapted_state = self.state_adaptor(state_tokens)
@@ -139,9 +133,7 @@ class RDTRunnerWithFLARE(nn.Module,
         return adapted_lang, adapted_img, adapted_state, adapted_future_vision
 
     def conditional_sample(self, lang_cond, lang_attn_mask, img_cond, state_traj, action_mask, ctrl_freqs):
-        '''
-        推理时的条件采样（保持不变，因为推理时不需要未来观测）
-        '''
+        """条件采样（推理时不需要未来观测）"""
         device = state_traj.device
         dtype = state_traj.dtype
         noisy_action = torch.randn(size=(state_traj.shape[0], self.pred_horizon, self.action_dim),
@@ -149,16 +141,16 @@ class RDTRunnerWithFLARE(nn.Module,
                                    device=device)
         action_mask = action_mask.expand(-1, self.pred_horizon, -1)
 
-        # Set step values
+        # 设置采样步数
         self.noise_scheduler_sample.set_timesteps(self.num_inference_timesteps)
 
         for t in self.noise_scheduler_sample.timesteps:
-            # Prepare state-action trajectory
+            # 准备状态-动作轨迹
             action_traj = torch.cat([noisy_action, action_mask], dim=2)
             action_traj = self.state_adaptor(action_traj)
             state_action_traj = torch.cat([state_traj, action_traj], dim=1)
 
-            # Predict the model output (推理时不使用未来观测)
+            # 模型预测（推理时不使用未来观测）
             model_output = self.model(state_action_traj,
                                       ctrl_freqs,
                                       t.unsqueeze(-1).to(device),
@@ -168,45 +160,44 @@ class RDTRunnerWithFLARE(nn.Module,
                                       future_vision_tokens=None,
                                       return_alignment_loss=False)
 
-            # Compute previous actions: x_t -> x_t-1
+            # 计算前一步动作: x_t -> x_t-1
             noisy_action = self.noise_scheduler_sample.step(model_output, t, noisy_action).prev_sample
             noisy_action = noisy_action.to(state_traj.dtype)
 
-        # Finally apply the action mask to mask invalid action dimensions
+        # 应用动作掩码
         noisy_action = noisy_action * action_mask
 
         return noisy_action
 
     def compute_loss(self, lang_tokens, lang_attn_mask, img_tokens, state_tokens, action_gt, action_mask,
-                     ctrl_freqs, future_vision_tokens=None) -> torch.Tensor:
-        '''
-        修改损失计算以包含对齐损失
+                     ctrl_freqs, future_vision_tokens=None) -> tuple:
+        """
+        计算损失，包含FLARE对齐损失
         
-        新增参数:
-            future_vision_tokens: (batch_size, future_vision_len, vision_token_dim) 未来观测视觉token
-        '''
+        Returns:
+            total_loss: 总损失
+            diffusion_loss: 扩散损失
+            alignment_loss: 对齐损失（如果使用FLARE）
+        """
         batch_size = lang_tokens.shape[0]
         device = lang_tokens.device
         
-        # Sample noise that we'll add to the actions
+        # 采样噪声和时间步
         noise = torch.randn(action_gt.shape, dtype=action_gt.dtype, device=device)
-        # Sample random diffusion timesteps
-        timesteps = torch.randint(0, self.num_train_timesteps, (batch_size, ), device=device).long()
-        # Add noise to the clean actions according to the noise magnitude at each timestep
+        timesteps = torch.randint(0, self.num_train_timesteps, (batch_size,), device=device).long()
         noisy_action = self.noise_scheduler.add_noise(action_gt, noise, timesteps)
 
-        # Concatenate the state and action tokens to form the input sequence
+        # 拼接状态和动作token
         state_action_traj = torch.cat([state_tokens, noisy_action], dim=1)
-        # Append the action mask to the input sequence
         action_mask = action_mask.expand(-1, state_action_traj.shape[1], -1)
         state_action_traj = torch.cat([state_action_traj, action_mask], dim=2)
         
-        # Align the dimension with the hidden size
+        # 适配条件
         adapted_results = self.adapt_conditions(lang_tokens, img_tokens, state_action_traj, future_vision_tokens)
         lang_cond, img_cond, state_action_traj = adapted_results[:3]
         adapted_future_vision = adapted_results[3] if len(adapted_results) > 3 else None
         
-        # Predict the denoised result with alignment loss
+        # 预测去噪结果
         return_alignment = adapted_future_vision is not None
         if return_alignment:
             pred, alignment_loss = self.model(
@@ -222,18 +213,18 @@ class RDTRunnerWithFLARE(nn.Module,
             )
             alignment_loss = None
 
-        pred_type = self.prediction_type
-        if pred_type == 'epsilon':
+        # 计算目标
+        if self.prediction_type == 'epsilon':
             target = noise
-        elif pred_type == 'sample':
+        elif self.prediction_type == 'sample':
             target = action_gt
         else:
-            raise ValueError(f"Unsupported prediction type {pred_type}")
+            raise ValueError(f"Unsupported prediction type {self.prediction_type}")
             
-        # 主要的扩散损失
+        # 扩散损失
         diffusion_loss = F.mse_loss(pred, target)
         
-        # 总损失 = 扩散损失 + 对齐损失
+        # 总损失
         total_loss = diffusion_loss
         if alignment_loss is not None:
             total_loss = total_loss + self.alignment_loss_weight * alignment_loss
@@ -241,14 +232,12 @@ class RDTRunnerWithFLARE(nn.Module,
         return total_loss, diffusion_loss, alignment_loss
 
     def predict_action(self, lang_tokens, lang_attn_mask, img_tokens, state_tokens, action_mask, ctrl_freqs):
-        '''
-        预测动作（推理时保持不变）
-        '''
-        # Prepare the state and conditions
+        """预测动作（推理时不使用未来观测）"""
+        # 准备状态和条件
         state_tokens = torch.cat([state_tokens, action_mask], dim=2)
         lang_cond, img_cond, state_traj, _ = self.adapt_conditions(lang_tokens, img_tokens, state_tokens)
 
-        # Run sampling
+        # 运行采样
         action_pred = self.conditional_sample(
             lang_cond,
             lang_attn_mask,
