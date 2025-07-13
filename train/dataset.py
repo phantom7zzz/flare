@@ -323,8 +323,13 @@ class VLAConsumerDatasetWithFLARE(Dataset):
                     state_norm = res["state_norm"]
                     
                     # HDF5暂时不支持动态未来观测计算，设为None
-                    future_obs_frame = None
-                    future_obs_mask = False
+                    future_obs_frame = res.get("future_obs_frame")
+                    future_obs_mask = res.get("future_obs_mask", False)
+                    # 确保有有效的未来观测数据
+                    if future_obs_frame is not None and future_obs_mask:
+                        print(f"✅ HDF5 future obs available: {future_obs_frame.shape}")
+                    else:
+                        print(f"⚠️  HDF5 future obs not available")
                     
                 else:
                     # 从buffer加载数据

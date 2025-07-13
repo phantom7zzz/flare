@@ -132,16 +132,26 @@ class RDTRunnerWithFLARE(nn.Module, CompatiblePyTorchModelHubMixin):
 
         return projector
 
-    def adapt_conditions(self, lang_tokens, img_tokens, state_tokens, future_vision_tokens=None):
-        """适配条件输入"""
-        adapted_lang = self.lang_adaptor(lang_tokens)
-        adapted_img = self.img_adaptor(img_tokens)
-        adapted_state = self.state_adaptor(state_tokens)
+    def adapt_conditions(self, lang_tokens, img_tokens, state_action_traj, future_vision_tokens):
+        # 🔧 强制数据类型转换 - 修复 BFloat16 vs Float 问题
+        target_dtype = torch.float32
         
-        adapted_future_vision = None
+        # 转换所有输入张量
+        if lang_tokens is not None:
+            lang_tokens = lang_tokens.to(target_dtype)
+        if img_tokens is not None:
+            img_tokens = img_tokens.to(target_dtype)
+        if state_action_traj is not None:
+            state_action_traj = state_action_traj.to(target_dtype)
         if future_vision_tokens is not None:
-            adapted_future_vision = self.future_vision_adaptor(future_vision_tokens)
-
+            future_vision_tokens = future_vision_tokens.to(target_dtype)
+        
+        # 原有适配逻辑
+        adapted_lang = self.lang_adaptor(lang_tokens) if lang_tokens is not None else None
+        adapted_img = self.img_adaptor(img_tokens) if img_tokens is not None else None
+        adapted_state = self.state_adaptor(state_action_traj) if state_action_traj is not None else None
+        adapted_future_vision = self.future_vision_adaptor(future_vision_tokens) if future_vision_tokens is not None else None
+        
         return adapted_lang, adapted_img, adapted_state, adapted_future_vision
 
     def conditional_sample(self, lang_cond, lang_attn_mask, img_cond, state_traj, action_mask, ctrl_freqs):

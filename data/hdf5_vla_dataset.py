@@ -266,6 +266,25 @@ class HDF5VLADataset:
                 "cam_right_wrist": cam_right_wrist,
                 "cam_right_wrist_mask": cam_right_wrist_mask,
             }
+            def compute_future_obs_frame(current_step, total_steps):
+                future_step = min(current_step + self.CHUNK_SIZE - 1, total_steps - 1)
+                return future_step, future_step < total_steps - 1
+    
+    # 在返回字典中添加未来观测信息
+            future_step, has_valid_future = compute_future_obs_frame(step_id, num_steps)
+    
+    # 获取未来观测图像
+            if has_valid_future:
+                future_cam_high = parse_img("cam_high", future_step)
+            else:
+                future_cam_high = cam_high  # 使用当前帧
+    
+            return True, {
+        # ... 现有字段 ...
+                "future_obs_frame": future_cam_high,
+                "future_obs_mask": has_valid_future,
+                "future_step_id": future_step,
+    }
 
     def parse_hdf5_file_state_only(self, file_path):
         """[Modify] Parse a hdf5 file to generate a state trajectory.
