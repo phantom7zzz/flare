@@ -1,4 +1,4 @@
-# data/episode_transform.py - 优化版本
+# data/episode_transform.py - 简化版本
 
 import numpy as np
 import tensorflow as tf
@@ -16,10 +16,12 @@ ACTION_CHUNK_SIZE = config["common"]["action_chunk_size"]
 @tf.function
 def process_episode_with_flare(epsd: dict, dataset_name: str, image_keys: list, image_mask: list) -> dict:
     """
-    处理episode以提取frames和json内容，支持FLARE的未来观测采样
+    处理episode以提取frames和json内容，支持FLARE的简化未来观测采样
     """
-    # 收集所有摄像头的所有帧
+    # 收集所有摄像头的所有帧 - 这是核心！
     all_frames = {}
+    total_frames = 0
+    
     for cam_idx in range(len(image_keys)):
         if image_mask[cam_idx] == 1:
             frames = tf.TensorArray(dtype=tf.uint8, size=0, dynamic_size=True)
@@ -27,12 +29,13 @@ def process_episode_with_flare(epsd: dict, dataset_name: str, image_keys: list, 
                 frame = step["observation"][image_keys[cam_idx]]
                 frames = frames.write(frames.size(), frame)
             all_frames[f"camera_{cam_idx}"] = frames.stack()
+            total_frames = frames.size()  # 所有摄像头帧数应该相同
         else:
             # 创建空帧占位符
             dummy_frame = tf.zeros([0, 0, 0], dtype=tf.uint8)
             all_frames[f"camera_{cam_idx}"] = tf.expand_dims(dummy_frame, 0)
 
-    # 收集历史frames（保持原逻辑）
+    # 处理历史frames（保持原逻辑）
     frames_0 = tf.TensorArray(dtype=tf.uint8, size=0, dynamic_size=True)
     frames_1 = tf.TensorArray(dtype=tf.uint8, size=0, dynamic_size=True)
     frames_2 = tf.TensorArray(dtype=tf.uint8, size=0, dynamic_size=True)
@@ -74,7 +77,6 @@ def process_episode_with_flare(epsd: dict, dataset_name: str, image_keys: list, 
 
     # 处理历史frames（保持原逻辑）
     frames_0 = frames_0.stack()
-    total_frames = tf.shape(frames_0)[0]
     
     # 计算past frames（保持原有逻辑）
     first_frame = tf.expand_dims(frames_0[0], axis=0)
@@ -134,7 +136,7 @@ def process_episode_with_flare(epsd: dict, dataset_name: str, image_keys: list, 
         "past_frames_2_time_mask": past_frames_2_time_mask,
         "past_frames_3": past_frames_3,
         "past_frames_3_time_mask": past_frames_3_time_mask,
-        # 存储所有摄像头的完整帧序列，用于未来观测采样
+        # 存储所有摄像头的完整帧序列，用于FLARE动态采样
         "all_camera_frames": all_frames,
         "total_frame_count": total_frames,
     }
@@ -142,7 +144,7 @@ def process_episode_with_flare(epsd: dict, dataset_name: str, image_keys: list, 
 
 def flatten_episode_with_flare(episode: dict) -> list:
     """
-    将episode扁平化为步骤列表，支持FLARE的未来观测采样
+    将episode扁平化为步骤列表，支持FLARE的动态未来观测采样
     """
     episode_dict = episode["episode_dict"]
     dataset_name = episode["dataset_name"]
@@ -186,17 +188,24 @@ def flatten_episode_with_flare(episode: dict) -> list:
         dtype=tf.bool,
     )
 
-    # FLARE: 计算未来观测帧
+    # FLARE核心：计算每个时间步的未来观测帧
     # 使用主摄像头（camera_0）作为未来观测
     main_camera_frames = all_camera_frames["camera_0"]
     
     def get_future_obs_frame(current_step):
-        """获取当前步骤对应的未来观测帧"""
-        # 未来观测是action chunk结束时的观测（论文中的H步后）
-        future_step = current_step + ACTION_CHUNK_SIZE
-        # 限制在有效范围内
+        """
+        获取当前步骤对应的未来观测帧
+        核心逻辑：future_step = current_step + ACTION_CHUNK_SIZE - 1
+        这代表action chunk执行完毕后的观测
+        """
+        future_step = current_step + ACTION_CHUNK_SIZE - 1
+        # 确保不超出轨迹边界
         future_step = tf.minimum(future_step, total_frames - 1)
-        return tf.gather(main_camera_frames, future_step), tf.less(future_step, total_frames)
+        # 获取未来观测帧
+        future_frame = tf.gather(main_camera_frames, future_step)
+        # 检查是否是有效的未来观测（没有超出轨迹边界）
+        is_valid = tf.less(current_step + ACTION_CHUNK_SIZE - 1, total_frames)
+        return future_frame, is_valid
     
     # 为每个时间步计算未来观测
     future_obs_frames = []
@@ -241,7 +250,7 @@ def flatten_episode_with_flare(episode: dict) -> list:
             "state_std": state_std[i],
             "state_mean": state_mean[i],
             "state_norm": state_norm[i],
-            # FLARE: 添加未来观测数据
+            # FLARE: 添加动态计算的未来观测数据
             "future_obs_frame": future_obs_frames[i],
             "future_obs_mask": future_obs_masks[i],
         })

@@ -325,6 +325,55 @@ def parse_args(input_args=None):
         default="Null",
         required=True,
     )
+     # ========== FLARE特定参数 ==========
+    parser.add_argument(
+        "--enable_flare",
+        action="store_true",
+        default=False,
+        help="Enable FLARE (Future-conditioned Language-guided Action REpresentation) training",
+    )
+    
+    parser.add_argument(
+        "--num_future_tokens",
+        type=int,
+        default=32,
+        help="Number of future observation tokens for FLARE",
+    )
+    
+    parser.add_argument(
+        "--activation_layer",
+        type=int,
+        default=6,
+        help="DiT layer index for extracting activations for alignment",
+    )
+    
+    parser.add_argument(
+        "--alignment_loss_weight",
+        type=float,
+        default=0.1,
+        help="Weight for the alignment loss in FLARE training",
+    )
+    
+    parser.add_argument(
+        "--num_vl_fusion_layers",
+        type=int,
+        default=4,
+        help="Number of vision-language fusion layers in FLARE",
+    )
+    
+    parser.add_argument(
+        "--num_qformer_layers",
+        type=int,
+        default=6,
+        help="Number of Q-Former layers for target generation in FLARE",
+    )
+    
+    parser.add_argument(
+        "--alignment_temperature",
+        type=float,
+        default=0.07,
+        help="Temperature parameter for contrastive alignment loss",
+    )
 
     if input_args is not None:
         args = parser.parse_args(input_args)

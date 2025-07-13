@@ -1,3 +1,5 @@
+# train/dataset.py - 简化版本
+
 import traceback
 import time
 import os
@@ -18,10 +20,10 @@ from data.hdf5_vla_dataset import HDF5VLADataset
 from train.image_corrupt import image_corrupt
 
 
-# 更新VLAConsumerDataset以支持未来观测
 class VLAConsumerDatasetWithFLARE(Dataset):
     """
-    支持FLARE功能的VLA消费者数据集，包含动态未来观测采样
+    支持FLARE功能的VLA消费者数据集
+    核心理念：动态使用轨迹最后一帧作为未来观测，无需预处理
     """
 
     def __init__(
@@ -44,9 +46,11 @@ class VLAConsumerDatasetWithFLARE(Dataset):
         # FLARE特定参数
         enable_future_obs=True,
         future_obs_prob=0.8,  # 使用未来观测的概率
+        action_chunk_size=32,  # 动作块大小
     ):
         super(VLAConsumerDatasetWithFLARE, self).__init__()
 
+        # ... 保持原有的初始化代码 ...
         # 加载控制频率
         with open("configs/dataset_control_freq.json", "r") as fp:
             self.control_freq = json.load(fp)
@@ -79,6 +83,7 @@ class VLAConsumerDatasetWithFLARE(Dataset):
         # FLARE特定属性
         self.enable_future_obs = enable_future_obs
         self.future_obs_prob = future_obs_prob
+        self.action_chunk_size = action_chunk_size
         
         if use_hdf5:
             self.hdf5_dataset = HDF5VLADataset(self.model_config_path)
@@ -110,10 +115,8 @@ class VLAConsumerDatasetWithFLARE(Dataset):
         a = iter(iterable)
         return zip(a, a)
 
-    def _load_data_from_chunk_with_future_obs(self, chunk_dir, chunk_item_idx):
-        """
-        从chunk加载数据，包含未来观测信息
-        """
+    def _load_data_from_chunk(self, chunk_dir, chunk_item_idx):
+        """从chunk加载数据"""
         time_stmp = time.time()
         while time.time() - time_stmp < 10.0:
             try:
@@ -145,24 +148,17 @@ class VLAConsumerDatasetWithFLARE(Dataset):
                 continue
         raise RuntimeError("Failed to load sample.")
 
-    def __len__(self) -> int:
-        if self.use_hdf5:
-            return len(self.hdf5_dataset)
-        else:
-            return self.num_chunks * self.chunk_size
-
-    def _safe_load_with_future_obs(self, index):
-        """
-        安全加载数据，包含未来观测处理
-        """
+    def _safe_load(self, index):
+        """安全加载数据"""
+        from data.producer import get_dirty_item, read_dirty_bit, save_dirty_bit
+        
         read_chunk_item_indices = []
         read_chunk_idx = index // self.chunk_size
         
         while len(read_chunk_item_indices) == 0:
             read_chunk_dir = os.path.join(self.buffer_dir, f"chunk_{read_chunk_idx}")
             try:
-                from train.dataset import get_clean_item
-                read_chunk_item_indices = get_clean_item(read_chunk_dir)
+                read_chunk_item_indices = get_dirty_item(read_chunk_dir)
             except BaseException as e:
                 print("Error catched when searching a clean chunk:", e)
                 traceback.print_exc()
@@ -174,7 +170,6 @@ class VLAConsumerDatasetWithFLARE(Dataset):
 
         # 修改dirty bit
         try:
-            from train.dataset import read_dirty_bit, save_dirty_bit
             dirty_bit = read_dirty_bit(read_chunk_dir)
             dirty_bit[read_chunk_item_index] = 1
             save_dirty_bit(read_chunk_dir, dirty_bit)
@@ -184,7 +179,7 @@ class VLAConsumerDatasetWithFLARE(Dataset):
 
         # 加载样本
         try:
-            content, meta = self._load_data_from_chunk_with_future_obs(read_chunk_dir, read_chunk_item_index)
+            content, meta = self._load_data_from_chunk(read_chunk_dir, read_chunk_item_index)
             self.last_content, self.last_meta = content, meta
         except BaseException as e:
             print("Error catched when loading sample:", e)
@@ -193,10 +188,119 @@ class VLAConsumerDatasetWithFLARE(Dataset):
 
         return (content, *meta)
 
+    def _extract_future_obs_from_chunk_data(self, chunk_data):
+        """
+        从chunk数据中提取未来观测
+        核心：直接从现有数据中动态计算未来观测
+        """
+        try:
+            # 检查是否有预计算的未来观测数据
+            if len(chunk_data) >= 16:  # 原有14个字段 + 2个未来观测字段
+                future_obs_frame = chunk_data[14] if len(chunk_data) > 14 else None
+                future_obs_mask = chunk_data[15] if len(chunk_data) > 15 else False
+                return future_obs_frame, future_obs_mask
+            
+            # 如果没有预计算的数据，返回None
+            return None, False
+            
+        except Exception as e:
+            print(f"Error extracting future obs from chunk data: {e}")
+            return None, False
+
+    def _compute_future_obs_from_episode_data(self, content, image_metas, current_step_id):
+        """
+        从episode数据动态计算未来观测
+        这是FLARE的核心：使用action chunk结束后的观测作为未来观测
+        """
+        try:
+            # 获取当前时间步
+            step_id = current_step_id
+            
+            # 计算未来观测的时间步：当前步 + action_chunk_size - 1
+            future_step = step_id + self.action_chunk_size - 1
+            
+            # 从image_metas中获取主摄像头（通常是第一个摄像头）的所有帧
+            # image_metas结构：[cam0_images, cam0_mask, cam1_images, cam1_mask, ...]
+            main_camera_images = image_metas[0]  # 主摄像头的图像序列
+            
+            # 检查未来步是否在有效范围内
+            if future_step < len(main_camera_images):
+                future_obs_frame = main_camera_images[future_step]
+                future_obs_mask = True
+            else:
+                # 如果超出范围，使用最后一帧
+                future_obs_frame = main_camera_images[-1]
+                future_obs_mask = False
+                
+            return future_obs_frame, future_obs_mask
+            
+        except Exception as e:
+            print(f"Error computing future obs from episode data: {e}")
+            return None, False
+
+    def _process_future_obs_image(self, future_obs_frame):
+        """处理未来观测图像"""
+        try:
+            if future_obs_frame is None or math.prod(future_obs_frame.shape) == 0:
+                return None
+                
+            # 转换为PIL图像
+            future_image = Image.fromarray(future_obs_frame)
+            
+            # 应用相同的图像处理流程
+            if self.image_size is not None:
+                future_image = transforms.Resize(self.image_size)(future_image)
+            
+            if self.auto_adjust_image_brightness:
+                pixel_values = list(future_image.getdata())
+                average_brightness = sum(sum(pixel) for pixel in pixel_values) / (len(pixel_values) * 255.0 * 3)
+                if average_brightness <= 0.15:
+                    future_image = transforms.ColorJitter(brightness=(1.75, 1.75))(future_image)
+            
+            # 轻微的图像增强（避免影响目标生成质量）
+            if self.image_aug and random.random() > 0.9:  # 只有10%概率
+                future_image = transforms.ColorJitter(brightness=0.05, contrast=0.05)(future_image)
+            
+            # 图像填充
+            if self.image_aspect_ratio == "pad":
+                def expand2square(pil_img, background_color):
+                    width, height = pil_img.size
+                    if width == height:
+                        return pil_img
+                    elif width > height:
+                        result = Image.new(pil_img.mode, (width, width), background_color)
+                        result.paste(pil_img, (0, (width - height) // 2))
+                        return result
+                    else:
+                        result = Image.new(pil_img.mode, (height, height), background_color)
+                        result.paste(pil_img, ((height - width) // 2, 0))
+                        return result
+                        
+                future_image = expand2square(
+                    future_image, 
+                    tuple(int(x * 255) for x in self.image_processor.image_mean)
+                )
+            
+            # 最终预处理
+            future_obs_tensor = self.image_processor.preprocess(
+                future_image, 
+                return_tensors="pt"
+            )["pixel_values"][0]
+            
+            return future_obs_tensor
+            
+        except Exception as e:
+            print(f"Error processing future observation image: {e}")
+            return None
+
+    def __len__(self) -> int:
+        if self.use_hdf5:
+            return len(self.hdf5_dataset)
+        else:
+            return self.num_chunks * self.chunk_size
+
     def __getitem__(self, index):
-        """
-        获取数据项，包含FLARE的未来观测处理
-        """
+        """获取数据项，包含FLARE的动态未来观测"""
         while True:
             data_dict = None
             try:
@@ -217,41 +321,48 @@ class VLAConsumerDatasetWithFLARE(Dataset):
                     state_std = res["state_std"]
                     state_mean = res["state_mean"]
                     state_norm = res["state_norm"]
-                    # HDF5暂时不支持未来观测，设为None
+                    
+                    # HDF5暂时不支持动态未来观测计算，设为None
                     future_obs_frame = None
                     future_obs_mask = False
+                    
                 else:
-                    # 从buffer加载，包含未来观测数据
-                    loaded_data = self._safe_load_with_future_obs(index)
+                    # 从buffer加载数据
+                    loaded_data = self._safe_load(index)
+                    
+                    # 基础数据解析
+                    base_data_count = 14  # 原有的数据字段数
                     (
                         content,
-                        _,
+                        step_id,  # 这个很重要，用于计算未来观测
                         states,
-                        _,
+                        _,  # state_chunk_time_mask
                         actions,
-                        _,
+                        _,  # action_chunk_time_mask
                         state_elem_mask,
-                        *image_metas,
+                        *image_metas,  # 图像相关数据
                         state_std,
                         state_mean,
                         state_norm,
-                    ) = loaded_data[:14]  # 原有数据
+                    ) = loaded_data[:base_data_count]
                     
-                    # 检查是否有未来观测数据
-                    if len(loaded_data) > 14:
-                        future_obs_frame = loaded_data[14]
-                        future_obs_mask = loaded_data[15] if len(loaded_data) > 15 else True
-                    else:
-                        future_obs_frame = None
-                        future_obs_mask = False
+                    # 提取未来观测：优先从预计算数据，否则动态计算
+                    future_obs_frame, future_obs_mask = self._extract_future_obs_from_chunk_data(loaded_data)
+                    
+                    # 如果没有预计算的未来观测，则动态计算
+                    if future_obs_frame is None and self.enable_future_obs:
+                        future_obs_frame, future_obs_mask = self._compute_future_obs_from_episode_data(
+                            content, image_metas, step_id
+                        )
 
+                # 构建数据字典
                 data_dict = {}
                 data_dict["dataset_name"] = content["dataset_name"]
                 data_dict["data_idx"] = self.dataset_name2id[data_dict["dataset_name"]]
                 data_dict["ctrl_freq"] = (self.control_freq[data_dict["dataset_name"]]
                                           if random.random() > self.cond_mask_prob else 0)
 
-                # 状态噪声处理
+                # 状态噪声处理（保持原逻辑）
                 if self.state_noise_snr is not None:
                     states += np.random.normal(
                         0.0,
@@ -267,7 +378,7 @@ class VLAConsumerDatasetWithFLARE(Dataset):
                                                 np.zeros_like(state_elem_mask))
                 data_dict["state_norm"] = state_norm
 
-                # 处理图像（保持原有逻辑）
+                # 处理历史图像（保持原有逻辑）
                 background_color = np.array(
                     [int(x * 255) for x in self.image_processor.image_mean],
                     dtype=np.uint8,
@@ -338,48 +449,33 @@ class VLAConsumerDatasetWithFLARE(Dataset):
                     preprocessed_images.append(image)
                 data_dict["images"] = preprocessed_images
 
-                # 处理未来观测图像
+                # FLARE核心：处理未来观测图像
                 future_obs_image = None
-                if (self.enable_future_obs and future_obs_frame is not None and 
-                    future_obs_mask and random.random() < self.future_obs_prob):
-                    try:
-                        # 处理未来观测帧
-                        if math.prod(future_obs_frame.shape) > 0:
-                            future_image = Image.fromarray(future_obs_frame)
-                            if self.image_size is not None:
-                                future_image = transforms.Resize(self.image_size)(future_image)
-                                
-                            # 应用相同的图像处理流程
-                            if self.image_aspect_ratio == "pad":
-                                def expand2square(pil_img, background_color):
-                                    width, height = pil_img.size
-                                    if width == height:
-                                        return pil_img
-                                    elif width > height:
-                                        result = Image.new(pil_img.mode, (width, width), background_color)
-                                        result.paste(pil_img, (0, (width - height) // 2))
-                                        return result
-                                    else:
-                                        result = Image.new(pil_img.mode, (height, height), background_color)
-                                        result.paste(pil_img, ((height - width) // 2, 0))
-                                        return result
-                                future_image = expand2square(future_image, tuple(int(x * 255) for x in processor.image_mean))
-                                
-                            future_obs_image = processor.preprocess(future_image, return_tensors="pt")["pixel_values"][0]
-                    except Exception as e:
-                        print(f"Error processing future observation: {e}")
-                        future_obs_image = None
+                use_future_obs = (self.enable_future_obs and 
+                                  future_obs_frame is not None and 
+                                  future_obs_mask and 
+                                  random.random() < self.future_obs_prob)
+                
+                if use_future_obs:
+                    future_obs_image = self._process_future_obs_image(future_obs_frame)
 
                 data_dict["future_obs_image"] = future_obs_image
+                data_dict["has_future_obs"] = use_future_obs
 
-                # 处理语言指令
+                # 处理文本指令
+                text_instruction = content.get("instruction", "")
+                if isinstance(text_instruction, bytes):
+                    text_instruction = text_instruction.decode('utf-8')
+                data_dict["text_instruction"] = text_instruction
+
+                # 处理语言指令（原有逻辑）
                 if self.use_precomp_lang_embed:
                     if content["instruction"][-1] == ".":
                         content["instruction"] = content["instruction"][:-1]
                     data_dict["lang_embed"] = (torch.load(content["instruction"])
                                                if random.random() > self.cond_mask_prob else self.empty_lang_embed)
                 else:
-                    instruction = (content["instruction"] if random.random() > self.cond_mask_prob else "")
+                    instruction = (text_instruction if random.random() > self.cond_mask_prob else "")
                     data_dict["input_ids"] = self.tokenizer(
                         instruction,
                         return_tensors="pt",
@@ -396,10 +492,8 @@ class VLAConsumerDatasetWithFLARE(Dataset):
                     if isinstance(v, np.ndarray):
                         data_dict[k] = torch.from_numpy(v)
 
-                for k, v in data_dict.items():
-                    assert not isinstance(v, np.ndarray), f"key: {k}, value: {v}"
-
                 return data_dict
+                
             except BaseException as e:
                 if data_dict is not None:
                     print(
@@ -413,9 +507,7 @@ class VLAConsumerDatasetWithFLARE(Dataset):
 
 
 class DataCollatorForVLAConsumerDatasetWithFLARE(object):
-    """
-    支持FLARE功能的数据收集器
-    """
+    """支持FLARE功能的数据收集器"""
 
     def __init__(self, tokenizer: transformers.PreTrainedTokenizer) -> None:
         self.tokenizer = tokenizer
@@ -429,7 +521,9 @@ class DataCollatorForVLAConsumerDatasetWithFLARE(object):
             "images": [],
             "data_indices": [],
             "ctrl_freqs": [],
-            "future_obs_images": [],  # 新增
+            "future_obs_images": [],  # 未来观测图像
+            "has_future_obs": [],     # 是否有有效的未来观测
+            "text_instructions": [],  # 文本指令
         }
         input_ids = []
         lang_embeds = []
@@ -459,6 +553,8 @@ class DataCollatorForVLAConsumerDatasetWithFLARE(object):
             batch["images"].append(torch.stack(instance["images"], dim=0))
             batch["data_indices"].append(instance["data_idx"])
             batch["ctrl_freqs"].append(instance["ctrl_freq"])
+            batch["text_instructions"].append(instance.get("text_instruction", ""))
+            batch["has_future_obs"].append(instance.get("has_future_obs", False))
             
             # 处理未来观测图像
             future_obs_image = instance.get("future_obs_image")
@@ -466,7 +562,8 @@ class DataCollatorForVLAConsumerDatasetWithFLARE(object):
                 batch["future_obs_images"].append(future_obs_image)
             else:
                 # 使用零张量作为占位符
-                batch["future_obs_images"].append(torch.zeros_like(instance["images"][0]))
+                dummy_shape = instance["images"][0].shape
+                batch["future_obs_images"].append(torch.zeros(dummy_shape))
 
         # 堆叠数据
         keys_to_stack = ["states", "actions", "state_elem_mask", "state_norm", "images", "future_obs_images"]
@@ -474,6 +571,7 @@ class DataCollatorForVLAConsumerDatasetWithFLARE(object):
             batch[key] = torch.stack(batch[key], dim=0)
 
         batch["ctrl_freqs"] = torch.tensor(batch["ctrl_freqs"])
+        batch["has_future_obs"] = torch.tensor(batch["has_future_obs"], dtype=torch.bool)
 
         # 处理语言数据
         if len(input_ids) > 0:
