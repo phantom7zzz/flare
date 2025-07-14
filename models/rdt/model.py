@@ -238,16 +238,20 @@ class RDTWithFLARE(nn.Module):
             return_alignment_loss: 是否返回对齐损失
         """
         # 🎯 确保输入数据类型一致
+        # 统一数据类型处理
         target_dtype = self.dtype
-        x = x.to(target_dtype)
+        device = x.device
+
+        # 确保所有输入张量使用相同的数据类型
+        x = x.to(dtype=target_dtype, device=device)
         if isinstance(freq, torch.Tensor):
-            freq = freq.to(target_dtype)
+            freq = freq.to(dtype=target_dtype, device=device)
         if isinstance(t, torch.Tensor):
-            t = t.to(target_dtype)
-        lang_c = lang_c.to(target_dtype)
-        img_c = img_c.to(target_dtype)
+            t = t.to(dtype=target_dtype, device=device)
+        lang_c = lang_c.to(dtype=target_dtype, device=device)
+        img_c = img_c.to(dtype=target_dtype, device=device)
         if future_vision_tokens is not None:
-            future_vision_tokens = future_vision_tokens.to(target_dtype)
+            future_vision_tokens = future_vision_tokens.to(dtype=target_dtype, device=device)
         
         batch_size = x.shape[0]
         
@@ -269,31 +273,6 @@ class RDTWithFLARE(nn.Module):
         # 添加位置编码
         x = x + self.x_pos_embed
         lang_c = lang_c + self.lang_cond_pos_embed[:, :lang_c.shape[1]]
-        if hasattr(self, 'img_cond_pos_embed') and self.img_cond_pos_embed is not None:
-            current_seq_len = img_c.size(1)
-            embed_seq_len = self.img_cond_pos_embed.size(1)
-            
-            if current_seq_len == embed_seq_len:
-                img_c = img_c + self.img_cond_pos_embed
-            else:
-                print(f"⚠️  图像位置嵌入维度不匹配: {current_seq_len} vs {embed_seq_len}")
-                
-                # 动态调整位置嵌入
-                if current_seq_len < embed_seq_len:
-                    # 截断位置嵌入
-                    pos_embed = self.img_cond_pos_embed[:, :current_seq_len, :]
-                else:
-                    # 扩展位置嵌入
-                    extra_len = current_seq_len - embed_seq_len
-                    last_pos = self.img_cond_pos_embed[:, -1:, :]
-                    extra_pos = last_pos.repeat(1, extra_len, 1)
-                    pos_embed = torch.cat([self.img_cond_pos_embed, extra_pos], dim=1)
-                if img_c.dtype != pos_embed.dtype:
-                    pos_embed = pos_embed.to(img_c.dtype)
-                img_c = img_c + pos_embed
-        else:
-            # 如果没有位置嵌入，直接跳过
-            pass
 
         # FLARE: 计算目标tokens（如果需要）
         target_future_tokens = None

@@ -90,7 +90,10 @@ def configure_a800_optimizations():
     print(f"   - Tensor Core TF32: {torch.backends.cuda.matmul.allow_tf32}")
     print(f"   - cuDNN TF32: {torch.backends.cudnn.allow_tf32}")
     print(f"   - Benchmark模式: {torch.backends.cudnn.benchmark}")
-    print(f"   - Flash Attention: {torch.backends.cuda.is_flash_attention_available()}")
+    if hasattr(torch.backends.cuda, "is_flash_attention_available"):
+        print(f"   - Flash Attention: {torch.backends.cuda.is_flash_attention_available()}")
+    else:
+        print("   - Flash Attention: (当前PyTorch版本不支持该检测)")
 
 
 def check_gpu_capabilities(logger):
@@ -117,7 +120,6 @@ def check_gpu_capabilities(logger):
 def train(args, logger):
     # 🎯 A800优化配置
     configure_a800_optimizations()
-    is_a800, gpu_memory = check_gpu_capabilities(logger)
     
     # Read the config
     with open(args.config_path, "r") as fp:
@@ -144,7 +146,7 @@ def train(args, logger):
         project_dir=logging_dir,
         project_config=accelerator_project_config,
     )
-
+    is_a800, gpu_memory = check_gpu_capabilities(logger)
     if args.report_to == "wandb":
         if not is_wandb_available():
             raise ImportError("Make sure to install wandb if you want to use it for logging during training.")

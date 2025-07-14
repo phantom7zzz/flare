@@ -25,10 +25,17 @@ class SiglipVisionTower(nn.Module):
             print('{} is already loaded, `load_model` called again, skipping.'.format(self.vision_tower_name))
             return
 
-        self.image_processor = SiglipImageProcessor.from_pretrained(self.vision_tower_name)
-        self.vision_tower = SiglipVisionModel.from_pretrained(self.vision_tower_name, device_map=device_map)
+        # 🔧 强制使用本地文件
+        self.image_processor = SiglipImageProcessor.from_pretrained(
+            self.vision_tower_name,
+            local_files_only=True  # 添加这行
+        )
+        self.vision_tower = SiglipVisionModel.from_pretrained(
+            self.vision_tower_name, 
+            device_map=device_map,
+            local_files_only=True  # 添加这行
+        )
         self.vision_tower.eval()
-
         self.is_loaded = True
 
     def feature_select(self, image_forward_outs):
