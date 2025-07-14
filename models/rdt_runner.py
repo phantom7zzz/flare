@@ -69,20 +69,21 @@ class RDTRunnerWithFLARE(nn.Module, CompatiblePyTorchModelHubMixin):
         # 创建条件适配器
         self.lang_adaptor = self.build_condition_adapter(config['lang_adaptor'],
                                                          in_features=lang_token_dim,
-                                                         out_features=hidden_size)
+                                                         out_features=hidden_size).to(dtype)
         self.img_adaptor = self.build_condition_adapter(config['img_adaptor'],
                                                         in_features=img_token_dim,
-                                                        out_features=hidden_size)
+                                                        out_features=hidden_size).to(dtype)
         self.state_adaptor = self.build_condition_adapter(
             config['state_adaptor'],
             in_features=state_token_dim * 2,
-            out_features=hidden_size)
+            out_features=hidden_size).to(dtype)
 
         # FLARE: 未来观测视觉token适配器
         self.future_vision_adaptor = self.build_condition_adapter(
             config.get('future_vision_adaptor', 'linear'),
             in_features=img_token_dim,
-            out_features=hidden_size)
+            out_features=hidden_size).to(dtype)
+        self._ensure_bf16_consistency()
 
         # 噪声调度器
         noise_scheduler_config = config['noise_scheduler']
@@ -111,7 +112,18 @@ class RDTRunnerWithFLARE(nn.Module, CompatiblePyTorchModelHubMixin):
                   [p.numel() for p in self.img_adaptor.parameters()] + 
                   [p.numel() for p in self.state_adaptor.parameters()] +
                   [p.numel() for p in self.future_vision_adaptor.parameters()]))
-
+    def _ensure_bf16_consistency(self):
+        """确保所有组件使用BF16"""
+        target_dtype = torch.bfloat16
+        
+        self.model = self.model.to(target_dtype)
+        self.lang_adaptor = self.lang_adaptor.to(target_dtype)
+        self.img_adaptor = self.img_adaptor.to(target_dtype)
+        self.state_adaptor = self.state_adaptor.to(target_dtype)
+        self.future_vision_adaptor = self.future_vision_adaptor.to(target_dtype)
+        
+        print(f"✅ RDT Runner统一使用: {target_dtype}")
+        
     def build_condition_adapter(self, projector_type, in_features, out_features):
         """构建条件适配器"""
         projector = None

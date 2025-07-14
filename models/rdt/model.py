@@ -110,7 +110,22 @@ class RDTWithFLARE(nn.Module):
         self.activation_aligner = None
         
         self.initialize_weights()
-
+        self._ensure_bf16_consistency()
+    def _ensure_bf16_consistency(self):
+        """确保模型所有组件都使用BF16"""
+        target_dtype = self.dtype
+        
+        # 转换所有参数
+        for name, param in self.named_parameters():
+            if param.dtype != target_dtype:
+                param.data = param.data.to(target_dtype)
+                
+        # 转换所有缓冲区  
+        for name, buffer in self.named_buffers():
+            if buffer.dtype != target_dtype and buffer.dtype.is_floating_point:
+                buffer.data = buffer.data.to(target_dtype)
+                
+        print(f"✅ 模型统一使用数据类型: {target_dtype}")
     def initialize_weights(self):
         """初始化模型权重"""
         # 初始化transformer层
@@ -222,6 +237,18 @@ class RDTWithFLARE(nn.Module):
             text_instructions: 文本指令（用于VL生成）
             return_alignment_loss: 是否返回对齐损失
         """
+        # 🎯 确保输入数据类型一致
+        target_dtype = self.dtype
+        x = x.to(target_dtype)
+        if isinstance(freq, torch.Tensor):
+            freq = freq.to(target_dtype)
+        if isinstance(t, torch.Tensor):
+            t = t.to(target_dtype)
+        lang_c = lang_c.to(target_dtype)
+        img_c = img_c.to(target_dtype)
+        if future_vision_tokens is not None:
+            future_vision_tokens = future_vision_tokens.to(target_dtype)
+        
         batch_size = x.shape[0]
         
         # 编码时间步和频率
@@ -242,7 +269,31 @@ class RDTWithFLARE(nn.Module):
         # 添加位置编码
         x = x + self.x_pos_embed
         lang_c = lang_c + self.lang_cond_pos_embed[:, :lang_c.shape[1]]
-        img_c = img_c + self.img_cond_pos_embed
+        if hasattr(self, 'img_cond_pos_embed') and self.img_cond_pos_embed is not None:
+            current_seq_len = img_c.size(1)
+            embed_seq_len = self.img_cond_pos_embed.size(1)
+            
+            if current_seq_len == embed_seq_len:
+                img_c = img_c + self.img_cond_pos_embed
+            else:
+                print(f"⚠️  图像位置嵌入维度不匹配: {current_seq_len} vs {embed_seq_len}")
+                
+                # 动态调整位置嵌入
+                if current_seq_len < embed_seq_len:
+                    # 截断位置嵌入
+                    pos_embed = self.img_cond_pos_embed[:, :current_seq_len, :]
+                else:
+                    # 扩展位置嵌入
+                    extra_len = current_seq_len - embed_seq_len
+                    last_pos = self.img_cond_pos_embed[:, -1:, :]
+                    extra_pos = last_pos.repeat(1, extra_len, 1)
+                    pos_embed = torch.cat([self.img_cond_pos_embed, extra_pos], dim=1)
+                if img_c.dtype != pos_embed.dtype:
+                    pos_embed = pos_embed.to(img_c.dtype)
+                img_c = img_c + pos_embed
+        else:
+            # 如果没有位置嵌入，直接跳过
+            pass
 
         # FLARE: 计算目标tokens（如果需要）
         target_future_tokens = None
