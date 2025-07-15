@@ -216,7 +216,7 @@ class RDTWithFLARE(nn.Module):
         labels = torch.arange(num_tokens, device=similarity.device).unsqueeze(0).expand(batch_size, -1)
         
         # 计算对比损失
-        loss = F.cross_entropy(similarity.view(-1, num_tokens), labels.view(-1))
+        loss = F.cross_entropy(similarity.reshape(-1, num_tokens), labels.reshape(-1))
         
         return loss
 
@@ -269,7 +269,6 @@ class RDTWithFLARE(nn.Module):
         
         # 拼接所有token: [timestep, freq, state+action, future_obs]
         x = torch.cat([t, freq, x, future_obs_tokens], dim=1)  # (B, T+3+M, D)
-
         # 添加位置编码
         x = x + self.x_pos_embed
         lang_c = lang_c + self.lang_cond_pos_embed[:, :lang_c.shape[1]]
@@ -282,10 +281,10 @@ class RDTWithFLARE(nn.Module):
                 vl_tokens, vl_mask = self.vl_token_generator(
                     future_obs_image, text_instructions
                 )
+
                 
                 # 2. 生成目标tokens
                 target_future_tokens = self.target_generator(vl_tokens, vl_mask)
-                
             except Exception as e:
                 raise  # 直接让程序崩溃，打印完整Traceback
 

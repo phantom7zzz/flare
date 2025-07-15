@@ -188,7 +188,7 @@ class RoboticDiffusionTransformerModel(object):
         tokens = self.text_tokenizer(instruction, return_tensors="pt", padding="longest",
                                      truncation=True)["input_ids"].to(device)
 
-        tokens = tokens.view(1, -1)
+        tokens = tokens.reshape(1, -1)
         with torch.no_grad():
             pred = self.text_model(tokens).last_hidden_state.detach()
 

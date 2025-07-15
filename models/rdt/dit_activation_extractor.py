@@ -148,7 +148,7 @@ class DiTActivationExtractor:
         future_token_end = future_token_start + self.num_future_tokens
         
         # 提取未来token激活
-        if activation.shape[1] <= future_token_end:
+        if activation.shape[1] < future_token_end:
             print(f"Warning: Activation sequence length {activation.shape[1]} is too short for future tokens")
             return None
             
@@ -231,8 +231,8 @@ class DiTActivationExtractor:
             return torch.tensor(0.0)
             
         # 计算余弦相似性
-        act1_flat = act1.view(-1, act1.shape[-1])
-        act2_flat = act2.view(-1, act2.shape[-1])
+        act1_flat = act1.reshape(-1, act1.shape[-1])
+        act2_flat = act2.reshape(-1, act2.shape[-1])
         
         similarity = F.cosine_similarity(act1_flat, act2_flat, dim=-1).mean()
         
@@ -344,8 +344,8 @@ class FLAREActivationAligner:
             'pred_norm': torch.norm(pred_tokens, dim=-1).mean().item(),
             'target_norm': torch.norm(target_tokens, dim=-1).mean().item(),
             'cosine_sim': F.cosine_similarity(
-                pred_tokens.view(-1, pred_tokens.shape[-1]),
-                target_tokens.view(-1, target_tokens.shape[-1]),
+                pred_tokens.reshape(-1, pred_tokens.shape[-1]),
+                target_tokens.reshape(-1, target_tokens.shape[-1]),
                 dim=-1
             ).mean().item(),
             'layer_idx': self.target_layer
@@ -377,7 +377,7 @@ class FLAREActivationAligner:
         labels = torch.arange(num_tokens, device=similarity.device).unsqueeze(0).expand(batch_size, -1)
         
         # 计算对比损失
-        loss = F.cross_entropy(similarity.view(-1, num_tokens), labels.view(-1))
+        loss = F.cross_entropy(similarity.reshape(-1, num_tokens), labels.reshape(-1))
         
         return loss
     

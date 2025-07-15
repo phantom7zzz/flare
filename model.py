@@ -125,7 +125,7 @@ class RDT:
                     padding="longest",
                     truncation=True,
                 )["input_ids"].to(device)
-                tokens = tokens.view(1, -1)
+                tokens = tokens.reshape(1, -1)
                 output = self.text_encoder(tokens)
                 pred = output.last_hidden_state.detach().cpu()
 
