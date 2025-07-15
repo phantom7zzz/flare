@@ -145,7 +145,7 @@ class RDTRunnerWithFLARE(nn.Module, CompatiblePyTorchModelHubMixin):
         return projector
 
     # 在 models/rdt_runner.py 中替换现有的 adapt_conditions 方法
-    def adapt_conditions(self, lang_tokens, img_tokens, state_action_traj, future_vision_tokens):
+    def adapt_conditions(self, lang_tokens, img_tokens, state_action_traj, future_vision_tokens=None):
         # 获取模型期望的数据类型
         target_dtype = next(self.lang_adaptor.parameters()).dtype
         

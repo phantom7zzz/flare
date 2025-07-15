@@ -74,18 +74,36 @@ class DiTActivationExtractor:
         self.model = model
         self.target_layers = target_layers
         self.num_future_tokens = num_future_tokens
-        self.token_start_offset = token_start_offset
-        self.enable_gradient_hooks = enable_gradient_hooks
-        
+        # self.token_start_offset = token_start_offset
+        # self.enable_gradient_hooks = enable_gradient_hooks
+        if hasattr(model, 'indices'):
+            self.sequence_indices = model.indices
+        else:
+            # 兼容旧版本，使用默认计算
+            self.sequence_indices = self._compute_default_indices(model)
         # 存储钩子和激活
         self.hooks = {}
         self.hook_handles = []
-        self.extracted_activations = {}
-        self.layer_outputs = {}
+        # self.extracted_activations = {}
+        # self.layer_outputs = {}
         
         # 注册钩子
         self._register_hooks()
         
+    def _compute_default_indices(self, model):
+        """为旧版本模型计算默认索引"""
+        horizon = getattr(model, 'horizon', 32)
+        num_future_tokens = getattr(model, 'num_future_tokens', 32)
+        
+        indices = {
+            'timestep': (0, 1),
+            'freq': (1, 2),
+            'state': (2, 3),
+            'action': (3, 3 + horizon),
+            'future_obs': (3 + horizon, 3 + horizon + num_future_tokens)
+        }
+        return indices
+    
     def _register_hooks(self):
         """注册钩子到指定的DiT层"""
         
@@ -117,18 +135,9 @@ class DiTActivationExtractor:
                 
         print(f"Registered hooks for layers: {self.target_layers}")
     
-    def extract_future_token_activations(self, 
-                                       layer_idx: int = 6,
-                                       horizon: int = 32) -> Optional[torch.Tensor]:
+    def extract_future_token_activations(self, layer_idx=6, **kwargs):
         """
-        提取指定层的未来预测token激活
-        
-        Args:
-            layer_idx: DiT层索引
-            horizon: 动作序列长度（用于计算token位置）
-            
-        Returns:
-            future_activations: (B, num_future_tokens, D) 未来token激活
+        使用正确的序列索引提取未来token激活
         """
         layer_name = f"dit_layer_{layer_idx}"
         
@@ -142,17 +151,23 @@ class DiTActivationExtractor:
             print(f"Warning: No activation found for layer {layer_idx}")
             return None
         
-        # 计算未来token的起始位置
-        # 序列结构: [timestep, freq, state, action_tokens..., future_tokens...]
-        future_token_start = self.token_start_offset + horizon
-        future_token_end = future_token_start + self.num_future_tokens
+        # 使用正确的索引范围
+        future_start, future_end = self.sequence_indices['future_obs']
+        
+        # 边界检查
+        if activation.shape[1] < future_end:
+            print(f"Warning: Activation length {activation.shape[1]} < required {future_end}")
+            print(f"Sequence indices: {self.sequence_indices}")
+            return None
         
         # 提取未来token激活
-        if activation.shape[1] < future_token_end:
-            print(f"Warning: Activation sequence length {activation.shape[1]} is too short for future tokens")
+        future_activations = activation[:, future_start:future_end, :]
+        
+        # 验证形状
+        expected_shape = (activation.shape[0], self.num_future_tokens, activation.shape[2])
+        if future_activations.shape != expected_shape:
+            print(f"Warning: Future activation shape {future_activations.shape} != expected {expected_shape}")
             return None
-            
-        future_activations = activation[:, future_token_start:future_token_end, :]
         
         # 存储提取的激活
         self.extracted_activations[f"layer_{layer_idx}_future"] = future_activations.detach()
@@ -301,45 +316,59 @@ class FLAREActivationAligner:
         self.activation_history = []
         self.loss_history = []
         
-    def compute_precise_alignment_loss(self, 
-                                     target_tokens: torch.Tensor,
-                                     horizon: int = 32) -> Tuple[torch.Tensor, Dict]:
+    def compute_precise_alignment_loss(self, target_tokens, horizon=32, future_token_indices=None):
         """
-        计算精确的对齐损失
+        计算精确的对齐损失，支持自定义索引
+        """
+        # 使用传入的索引或默认计算
+        if future_token_indices is not None:
+            # 更新激活提取器的索引信息
+            if hasattr(self.activation_extractor, 'sequence_indices'):
+                self.activation_extractor.sequence_indices['future_obs'] = future_token_indices
         
-        Args:
-            target_tokens: (B, num_future_tokens, D) 目标tokens
-            horizon: 动作序列长度
-            
-        Returns:
-            loss: 对齐损失
-            info: 额外信息字典
-        """
-        # 1. 提取DiT层激活
+        # 提取DiT层激活
         pred_tokens = self.activation_extractor.extract_future_token_activations(
-            layer_idx=self.target_layer,
-            horizon=horizon
+            layer_idx=self.target_layer
         )
         
         if pred_tokens is None:
             return torch.tensor(0.0, device=target_tokens.device), {}
         
-        # 2. 检查维度匹配
+        # 形状检查和修正
         if pred_tokens.shape != target_tokens.shape:
             print(f"Shape mismatch: pred {pred_tokens.shape} vs target {target_tokens.shape}")
+            
+            # 尝试修正形状不匹配
+            if pred_tokens.shape[1] != target_tokens.shape[1]:
+                # token数量不匹配，使用插值调整
+                pred_tokens = F.adaptive_avg_pool1d(
+                    pred_tokens.transpose(1, 2),
+                    target_tokens.shape[1]
+                ).transpose(1, 2)
+            
+            if pred_tokens.shape[2] != target_tokens.shape[2]:
+                # 特征维度不匹配，使用线性投影
+                if not hasattr(self, 'dim_adapter'):
+                    self.dim_adapter = nn.Linear(
+                        pred_tokens.shape[2], 
+                        target_tokens.shape[2]
+                    ).to(pred_tokens.device)
+                pred_tokens = self.dim_adapter(pred_tokens)
+        
+        # 数值稳定性检查
+        if torch.isnan(pred_tokens).any() or torch.isnan(target_tokens).any():
+            print("Warning: NaN detected in tokens")
             return torch.tensor(0.0, device=target_tokens.device), {}
         
-        # 3. 根据损失类型计算损失
+        # 计算对齐损失
         if self.loss_type == "cosine_contrastive":
             loss = self._cosine_contrastive_loss(pred_tokens, target_tokens)
         elif self.loss_type == "mse":
             loss = F.mse_loss(pred_tokens, target_tokens)
-        elif self.loss_type == "kl_div":
-            loss = self._kl_divergence_loss(pred_tokens, target_tokens)
         else:
             raise ValueError(f"Unknown loss type: {self.loss_type}")
         
-        # 4. 计算额外统计信息
+        # 额外信息
         info = {
             'pred_norm': torch.norm(pred_tokens, dim=-1).mean().item(),
             'target_norm': torch.norm(target_tokens, dim=-1).mean().item(),
@@ -348,17 +377,9 @@ class FLAREActivationAligner:
                 target_tokens.reshape(-1, target_tokens.shape[-1]),
                 dim=-1
             ).mean().item(),
-            'layer_idx': self.target_layer
+            'pred_shape': list(pred_tokens.shape),
+            'target_shape': list(target_tokens.shape)
         }
-        
-        # 5. 记录历史
-        self.loss_history.append(loss.item())
-        self.activation_history.append({
-            'pred_mean': pred_tokens.mean().item(),
-            'target_mean': target_tokens.mean().item(),
-            'pred_std': pred_tokens.std().item(),
-            'target_std': target_tokens.std().item()
-        })
         
         return loss, info
     

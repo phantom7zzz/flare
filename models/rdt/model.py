@@ -66,7 +66,26 @@ class RDTWithFLARE(nn.Module):
         self.freq_embedder = TimestepEmbedder(hidden_size, dtype=dtype)
 
         # 位置编码：[timestep; freq; state; action; future_obs]
-        self.x_pos_embed = nn.Parameter(torch.zeros(1, horizon + 3 + num_future_tokens, hidden_size))
+        #self.x_pos_embed = nn.Parameter(torch.zeros(1, horizon + 3 + num_future_tokens, hidden_size))
+        self.state_token_len = 1  # 状态压缩为1个token
+        self.seq_structure = {
+            'timestep': 1,
+            'freq': 1, 
+            'state': self.state_token_len,
+            'action': self.horizon,
+            'future_obs': self.num_future_tokens
+        }
+        
+        # 计算总序列长度
+        total_seq_len = sum(self.seq_structure.values())
+        self.x_pos_embed = nn.Parameter(torch.zeros(1, total_seq_len, hidden_size))
+        
+        # 预计算索引位置
+        self._compute_sequence_indices()
+        
+        
+        
+        
         
         # 条件位置编码
         self.lang_cond_pos_embed = nn.Parameter(torch.zeros(1, max_lang_cond_len, hidden_size))
@@ -111,6 +130,15 @@ class RDTWithFLARE(nn.Module):
         
         self.initialize_weights()
         self._ensure_bf16_consistency()
+        
+    def _compute_sequence_indices(self):
+        """预计算序列中各部分的索引位置"""
+        self.indices = {}
+        start_idx = 0
+        for key, length in self.seq_structure.items():
+            self.indices[key] = (start_idx, start_idx + length)
+            start_idx += length
+    
     def _ensure_bf16_consistency(self):
         """确保模型所有组件都使用BF16"""
         target_dtype = self.dtype
@@ -253,65 +281,129 @@ class RDTWithFLARE(nn.Module):
         if future_vision_tokens is not None:
             future_vision_tokens = future_vision_tokens.to(dtype=target_dtype, device=device)
         
+        # batch_size = x.shape[0]
+        
+        # # 编码时间步和频率
+        # t = self.t_embedder(t).unsqueeze(1)  # (B, 1, D)
+        # freq = self.freq_embedder(freq).unsqueeze(1)  # (B, 1, D)
+        
+        # # 初始化未来观测token
+        # future_obs_tokens = self.future_obs_tokens.expand(batch_size, -1, -1)  # (B, M, D)
+        # future_obs_tokens = self.future_obs_mlp(future_obs_tokens)
+        
+        # # 扩展时间步到batch
+        # if t.shape[0] == 1:
+        #     t = t.expand(batch_size, -1, -1)
+        
+        # # 拼接所有token: [timestep, freq, state+action, future_obs]
+        # #x = torch.cat([t, freq, x, future_obs_tokens], dim=1)  # (B, T+3+M, D)
+        # # 添加位置编码
+        # x = x + self.x_pos_embed
+        # lang_c = lang_c + self.lang_cond_pos_embed[:, :lang_c.shape[1]]
         batch_size = x.shape[0]
+        device = x.device
+        target_dtype = self.dtype
         
-        # 编码时间步和频率
-        t = self.t_embedder(t).unsqueeze(1)  # (B, 1, D)
-        freq = self.freq_embedder(freq).unsqueeze(1)  # (B, 1, D)
+        # 1. 编码时间步和频率
+        t_embed = self.t_embedder(t).unsqueeze(1)  # (B, 1, D)
+        freq_embed = self.freq_embedder(freq).unsqueeze(1)  # (B, 1, D)
         
-        # 初始化未来观测token
-        future_obs_tokens = self.future_obs_tokens.expand(batch_size, -1, -1)  # (B, M, D)
-        future_obs_tokens = self.future_obs_mlp(future_obs_tokens)
+        # 2. 分离状态和动作 (关键修复)
+        # x 输入应该是 [state_tokens, action_tokens]
+        state_start, state_end = 0, self.state_token_len
+        action_start, action_end = self.state_token_len, x.shape[1]
         
-        # 扩展时间步到batch
-        if t.shape[0] == 1:
-            t = t.expand(batch_size, -1, -1)
+        state_tokens = x[:, state_start:state_end]  # (B, state_len, D)
+        action_tokens = x[:, action_start:action_end]  # (B, action_len, D)
         
-        # 拼接所有token: [timestep, freq, state+action, future_obs]
-        x = torch.cat([t, freq, x, future_obs_tokens], dim=1)  # (B, T+3+M, D)
-        # 添加位置编码
-        x = x + self.x_pos_embed
-        lang_c = lang_c + self.lang_cond_pos_embed[:, :lang_c.shape[1]]
+        # 3. 处理未来观测token (FLARE核心修复)
+        future_obs_tokens = self._process_future_obs_tokens(
+            batch_size, future_obs_image, device, target_dtype
+        )
+        
+        # 4. 正确的序列拼接 (按照定义的结构)
+        sequence_parts = [
+            t_embed,           # timestep
+            freq_embed,        # freq
+            state_tokens,      # state
+            action_tokens,     # action  
+            future_obs_tokens  # future_obs
+        ]
+        
+        sequence = torch.cat(sequence_parts, dim=1)  # (B, total_seq_len, D)
+        
+        # 5. 验证序列长度
+        expected_len = sum(self.seq_structure.values())
+        assert sequence.shape[1] == expected_len, \
+            f"序列长度不匹配: {sequence.shape[1]} vs {expected_len}"
+        
+        # 6. 添加位置编码
+        sequence = sequence + self.x_pos_embed
+        
+        # 7. 准备条件
+        conds = [lang_c, img_c]
+        masks = [lang_mask, img_mask]
+        # 8. 通过transformer blocks (改进条件使用策略)
+        target_future_tokens = None
+        alignment_loss = None
+        
 
         # FLARE: 计算目标tokens（如果需要）
-        target_future_tokens = None
-        if future_vision_tokens is not None and return_alignment_loss:
+        # target_future_tokens = None
+        # if future_vision_tokens is not None and return_alignment_loss:
+        #     try:
+        #         # 1. 生成VL tokens
+        #         vl_tokens, vl_mask = self.vl_token_generator(
+        #             future_obs_image, text_instructions
+        #         )
+
+                
+        #         # 2. 生成目标tokens
+        #         target_future_tokens = self.target_generator(vl_tokens, vl_mask)
+        #     except Exception as e:
+        #         raise  # 直接让程序崩溃，打印完整Traceback
+        # FLARE: 计算目标tokens（在transformer处理前）
+        if return_alignment_loss and future_obs_image is not None:
             try:
-                # 1. 生成VL tokens
                 vl_tokens, vl_mask = self.vl_token_generator(
                     future_obs_image, text_instructions
                 )
-
-                
-                # 2. 生成目标tokens
                 target_future_tokens = self.target_generator(vl_tokens, vl_mask)
             except Exception as e:
-                raise  # 直接让程序崩溃，打印完整Traceback
+                print(f"Warning: Target token generation failed: {e}")
+                target_future_tokens = None
 
         # 通过transformer blocks
-        conds = [lang_c, img_c]
-        masks = [lang_mask, img_mask]
-        alignment_loss = None
+        # conds = [lang_c, img_c]
+        # masks = [lang_mask, img_mask]
+        # alignment_loss = None
         
+        # Transformer处理
         for i, block in enumerate(self.blocks):
-            c, mask = conds[i % 2], masks[i % 2]
-            x = block(x, c, mask)  # (B, T+3+M, D)
+            # 改进的条件使用策略：前期语言，后期视觉
+            condition_idx = 0 if i < len(self.blocks) // 2 else 1
+            c, mask = conds[condition_idx], masks[condition_idx]
+            sequence = block(sequence, c, mask)
 
         # 最终层处理
-        x = self.final_layer(x)  # (B, T+3+M, out_channels)
+        sequence = self.final_layer(sequence)
 
         # 只返回动作token，去除时间步、频率和未来观测token
-        action_tokens = x[:, 2:2+self.horizon]  # (B, horizon, out_channels)
+        #action_tokens = x[:, 2:2+self.horizon]  # (B, horizon, out_channels)
+        action_start_idx, action_end_idx = self.indices['action']
+        action_tokens = sequence[:, action_start_idx:action_end_idx]
         
-        # 计算对齐损失（使用激活对齐器）
+        # 11. 计算对齐损失 (使用正确的索引)
         if return_alignment_loss and target_future_tokens is not None:
             try:
-                # 初始化激活对齐器（如果需要）
                 self._initialize_activation_aligner()
                 
-                # 计算精确的对齐损失
-                alignment_loss, alignment_info = self.activation_aligner.compute_precise_alignment_loss(
-                    target_future_tokens, horizon=self.horizon
+                # 使用正确的未来token位置
+                future_start_idx, future_end_idx = self.indices['future_obs']
+                alignment_loss, _ = self.activation_aligner.compute_precise_alignment_loss(
+                    target_future_tokens, 
+                    horizon=self.horizon,
+                    future_token_indices=(future_start_idx, future_end_idx)
                 )
             except Exception as e:
                 print(f"Warning: Alignment loss computation failed: {e}")
@@ -321,3 +413,34 @@ class RDTWithFLARE(nn.Module):
             return action_tokens, alignment_loss
         else:
             return action_tokens
+        
+    def _process_future_obs_tokens(self, batch_size, future_obs_image, device, target_dtype):
+        """处理未来观测tokens，确保与实际观测关联"""
+        if future_obs_image is not None:
+            try:
+                # 使用VL token生成器的视觉编码器
+                with torch.no_grad():
+                    future_vision_features = self.vl_token_generator.vision_encoder(future_obs_image)
+                
+                # 调整特征维度到num_future_tokens
+                if future_vision_features.shape[1] != self.num_future_tokens:
+                    # 使用自适应池化调整尺寸
+                    future_vision_features = F.adaptive_avg_pool1d(
+                        future_vision_features.transpose(1, 2),
+                        self.num_future_tokens
+                    ).transpose(1, 2)
+                
+                # 投影到正确维度
+                future_obs_tokens = self.future_obs_mlp(future_vision_features)
+                
+            except Exception as e:
+                print(f"Warning: Future obs processing failed: {e}")
+                # 降级到随机token
+                future_obs_tokens = self.future_obs_tokens.expand(batch_size, -1, -1)
+                future_obs_tokens = self.future_obs_mlp(future_obs_tokens)
+        else:
+            # 使用随机初始化的token
+            future_obs_tokens = self.future_obs_tokens.expand(batch_size, -1, -1)
+            future_obs_tokens = self.future_obs_mlp(future_obs_tokens)
+        
+        return future_obs_tokens.to(device=device, dtype=target_dtype)

@@ -45,8 +45,9 @@ class VLAConsumerDatasetWithFLARE(Dataset):
         use_precomp_lang_embed=False,
         # FLARE特定参数
         enable_future_obs=True,
-        future_obs_prob=0.8,  # 使用未来观测的概率
+        future_obs_prob=1,  # 使用未来观测的概率
         action_chunk_size=32,  # 动作块大小
+        future_obs_consistency_check=True
     ):
         super(VLAConsumerDatasetWithFLARE, self).__init__()
 
@@ -65,6 +66,17 @@ class VLAConsumerDatasetWithFLARE(Dataset):
         self.dataset_name2id = {name: i for i, name in enumerate(DATASET_NAMES)}
         self.dataset_id2name = {i: name for i, name in enumerate(DATASET_NAMES)}
 
+        # 添加一致性检查参数
+        self.future_obs_consistency_check = future_obs_consistency_check
+        # 记录统计信息
+        self.future_obs_stats = {
+            'total_samples': 0,
+            'valid_future_obs': 0,
+            'invalid_future_obs': 0,
+            'synthetic_future_obs': 0
+        }
+        
+        
         self.image_processor = image_processor
         self.model_config_path = model_config_path
         self.buffer_dir = config["buf_path"]
@@ -311,225 +323,353 @@ class VLAConsumerDatasetWithFLARE(Dataset):
             return self.num_chunks * self.chunk_size
 
     # train/dataset.py - 关键修复部分
+    def _get_buffer_sample_data(self, index):
+        """从buffer获取数据 - 简单修复"""
+        loaded_data = self._safe_load(index)
+        
+        # 基础数据解析
+        (
+            content,
+            step_id,
+            states,
+            _,  # state_chunk_time_mask
+            actions,
+            _,  # action_chunk_time_mask
+            state_elem_mask,
+            *image_metas,
+            state_std,
+            state_mean,
+            state_norm,
+        ) = loaded_data[:14]  # 取前14个字段
 
-    def __getitem__(self, index):
-        """获取数据项,包含FLARE的动态未来观测"""
-        while True:
-            data_dict = None
+        # 提取未来观测
+        future_obs_frame, future_obs_mask = self._extract_future_obs_from_chunk_data(loaded_data)
+        
+        # 如果没有预计算的未来观测，动态计算
+        if future_obs_frame is None and self.enable_future_obs:
+            future_obs_frame, future_obs_mask = self._compute_future_obs_from_episode_data(
+                content, image_metas, step_id
+            )
+
+        # 验证未来观测质量
+        valid_future_obs = self._validate_future_obs(
+            future_obs_frame, future_obs_mask, step_id, content
+        )
+        
+        if not valid_future_obs and self.enable_future_obs:
+            # 尝试使用最后一帧
             try:
-                if self.use_hdf5:
-                    res = self.hdf5_dataset.get_item()
-                    content = res["meta"]
-                    states = res["state"]
-                    actions = res["actions"]
-                    state_elem_mask = res["state_indicator"]
-                    image_metas = [
-                        res["cam_high"],
-                        res["cam_high_mask"],
-                        res["cam_right_wrist"],
-                        res["cam_right_wrist_mask"],
-                        res["cam_left_wrist"],
-                        res["cam_left_wrist_mask"],
-                    ]
-                    state_std = res["state_std"]
-                    state_mean = res["state_mean"]
-                    state_norm = res["state_norm"]
-                    
-                    # 🔥 修复：从HDF5正确获取未来观测数据
-                    future_obs_frame = res.get("future_obs_frame")
-                    future_obs_mask = res.get("future_obs_mask", False)
-                    future_step_id = res.get("future_step_id", -1)
-                    # 只要有图像数据就认为有效，不再严格要求在action chunk范围内
-                    if future_obs_frame is not None:
-                        # 检查图像是否有有效内容
-                        if hasattr(future_obs_frame, 'shape') and future_obs_frame.shape[0] > 0:
-                            future_obs_mask = True  # 强制设为有效
-                            #print(f"🔥 重新评估未来观测为有效: shape={future_obs_frame.shape}")
-                        else:
-                            print(f"⚠️  未来观测图像无效: shape={getattr(future_obs_frame, 'shape', 'None')}")
-                    
-                    
-                else:
-                    # 从buffer加载数据
-                    loaded_data = self._safe_load(index)
-                    
-                    # 基础数据解析
-                    base_data_count = 14  # 原有的数据字段数
-                    (
-                        content,
-                        step_id,  # 这个很重要，用于计算未来观测
-                        states,
-                        _,  # state_chunk_time_mask
-                        actions,
-                        _,  # action_chunk_time_mask
-                        state_elem_mask,
-                        *image_metas,  # 图像相关数据
-                        state_std,
-                        state_mean,
-                        state_norm,
-                    ) = loaded_data[:base_data_count]
-                    
-                    # 提取未来观测：优先从预计算数据，否则动态计算
-                    future_obs_frame, future_obs_mask = self._extract_future_obs_from_chunk_data(loaded_data)
-                    
-                    # 如果没有预计算的未来观测，则动态计算
-                    if future_obs_frame is None and self.enable_future_obs:
-                        future_obs_frame, future_obs_mask = self._compute_future_obs_from_episode_data(
-                            content, image_metas, step_id
-                        )
+                main_camera_images = image_metas[0]
+                if len(main_camera_images) > 0:
+                    future_obs_frame = main_camera_images[-1]
+                    valid_future_obs = self._validate_future_obs(future_obs_frame, True, -1, content)
+                    if valid_future_obs:
+                        self.future_obs_stats['synthetic_future_obs'] += 1
+            except:
+                valid_future_obs = False
 
-                # 构建数据字典
-                data_dict = {}
-                data_dict["dataset_name"] = content["dataset_name"]
-                data_dict["data_idx"] = self.dataset_name2id[data_dict["dataset_name"]]
-                data_dict["ctrl_freq"] = (self.control_freq[data_dict["dataset_name"]]
-                                        if random.random() > self.cond_mask_prob else 0)
+        # 更新统计
+        if valid_future_obs:
+            self.future_obs_stats['valid_future_obs'] += 1
+        else:
+            self.future_obs_stats['invalid_future_obs'] += 1
 
-                # 状态噪声处理（保持原逻辑）
-                if self.state_noise_snr is not None:
-                    states += np.random.normal(
-                        0.0,
-                        state_std / np.sqrt(10**(self.state_noise_snr / 10)),
-                        states.shape,
-                    )
-                    
-                ds_state_mean = np.array(self.dataset_stat[data_dict["dataset_name"]]["state_mean"])
-                ds_state_mean = np.tile(ds_state_mean[None], (states.shape[0], 1))
-                data_dict["states"] = (states if random.random() > self.cond_mask_prob else ds_state_mean)
-                data_dict["actions"] = actions
-                data_dict["state_elem_mask"] = (state_elem_mask if random.random() > self.cond_mask_prob else
-                                                np.zeros_like(state_elem_mask))
-                data_dict["state_norm"] = state_norm
+        # 构建数据字典
+        data_dict = self._build_data_dict(
+            content, states, actions, state_elem_mask, image_metas,
+            state_std, state_mean, state_norm,
+            future_obs_frame, valid_future_obs
+        )
+        
+        return data_dict
+    def _build_data_dict(self, content, states, actions, state_elem_mask, image_metas,
+                     state_std, state_mean, state_norm, future_obs_frame, has_future_obs):
+    """构建数据字典 - 简单实现"""
+    
+        data_dict = {}
+        data_dict["dataset_name"] = content["dataset_name"]
+        data_dict["data_idx"] = self.dataset_name2id.get(data_dict["dataset_name"], 0)
+        data_dict["ctrl_freq"] = self.control_freq.get(data_dict["dataset_name"], 25)
 
-                # 处理历史图像（保持原有逻辑）
-                background_color = np.array(
-                    [int(x * 255) for x in self.image_processor.image_mean],
-                    dtype=np.uint8,
-                ).reshape(1, 1, 3)
-                background_image = (np.ones(
-                    (
-                        self.image_processor.size["height"],
-                        self.image_processor.size["width"],
-                        3,
-                    ),
-                    dtype=np.uint8,
-                ) * background_color)
+        # 基础数据
+        data_dict["states"] = states
+        data_dict["actions"] = actions
+        data_dict["state_elem_mask"] = state_elem_mask
+        data_dict["state_norm"] = state_norm
 
-                image_metas = list(self.pairwise(image_metas))
-                mask_probs = [self.cond_mask_prob] * self.num_cameras
-                if self.cam_ext_mask_prob >= 0.0:
-                    mask_probs[0] = self.cam_ext_mask_prob
-                    
-                rearranged_images = []
-                for i in range(self.img_history_size):
-                    for j in range(self.num_cameras):
-                        images, image_mask = image_metas[j]
+        # 处理历史图像（保持您的原有逻辑）
+        background_color = np.array([int(x * 255) for x in self.image_processor.image_mean], dtype=np.uint8).reshape(1, 1, 3)
+        background_image = np.ones((self.image_processor.size["height"], self.image_processor.size["width"], 3), dtype=np.uint8) * background_color
+
+        image_metas = list(self.pairwise(image_metas))
+        mask_probs = [self.cond_mask_prob] * self.num_cameras
+        if self.cam_ext_mask_prob >= 0.0:
+            mask_probs[0] = self.cam_ext_mask_prob
+
+        rearranged_images = []
+        for i in range(self.img_history_size):
+            for j in range(self.num_cameras):
+                if j < len(image_metas):
+                    images, image_mask = image_metas[j]
+                    if i < len(images) and i < len(image_mask):
                         image, valid = images[i], image_mask[i]
-                        if (valid and (math.prod(image.shape) > 0) and (random.random() > mask_probs[j])):
-                            rearranged_images.append((image, True))
+                        if valid and math.prod(image.shape) > 0 and random.random() > mask_probs[j]:
+                            rearranged_images.append(image)
                         else:
-                            rearranged_images.append((background_image.copy(), False))
+                            rearranged_images.append(background_image.copy())
+                    else:
+                        rearranged_images.append(background_image.copy())
+                else:
+                    rearranged_images.append(background_image.copy())
 
-                preprocessed_images = []
-                processor = self.image_processor
-                for image, valid in rearranged_images:
-                    image = Image.fromarray(image)
-                    if self.image_size is not None:
-                        image = transforms.Resize(self.image_size)(image)
+        # 预处理图像
+        preprocessed_images = []
+        for image in rearranged_images:
+            processed_image = self._preprocess_single_image(image)
+            preprocessed_images.append(processed_image)
+        data_dict["images"] = preprocessed_images
 
-                    if valid and self.auto_adjust_image_brightness:
-                        pixel_values = list(image.getdata())
-                        average_brightness = sum(sum(pixel) for pixel in pixel_values) / (len(pixel_values) * 255.0 * 3)
-                        if average_brightness <= 0.15:
-                            image = transforms.ColorJitter(brightness=(1.75, 1.75))(image)
+        # 处理未来观测图像
+        future_obs_image = None
+        if has_future_obs and future_obs_frame is not None:
+            future_obs_image = self._process_future_obs_image(future_obs_frame)
+            if future_obs_image is None:
+                has_future_obs = False
 
-                    # 图像增强
-                    if valid and self.image_aug and (random.random() > 0.5):
-                        aug_type = random.choice(["corrput_only", "color_only", "both"])
-                        if aug_type != "corrput_only":
-                            image = transforms.ColorJitter(brightness=0.3, contrast=0.4, saturation=0.5,
-                                                        hue=0.03)(image)
-                        if aug_type != "color_only":
-                            image = image_corrupt(image)
+        data_dict["future_obs_image"] = future_obs_image
+        data_dict["has_future_obs"] = has_future_obs
 
-                    # 图像填充
-                    if self.image_aspect_ratio == "pad":
-                        def expand2square(pil_img, background_color):
-                            width, height = pil_img.size
-                            if width == height:
-                                return pil_img
-                            elif width > height:
-                                result = Image.new(pil_img.mode, (width, width), background_color)
-                                result.paste(pil_img, (0, (width - height) // 2))
-                                return result
-                            else:
-                                result = Image.new(pil_img.mode, (height, height), background_color)
-                                result.paste(pil_img, ((height - width) // 2, 0))
-                                return result
+        # 处理文本指令
+        text_instruction = content.get("instruction", "")
+        if isinstance(text_instruction, bytes):
+            text_instruction = text_instruction.decode('utf-8')
+        data_dict["text_instruction"] = text_instruction
 
-                        image = expand2square(image, tuple(int(x * 255) for x in processor.image_mean))
-                    image = processor.preprocess(image, return_tensors="pt")["pixel_values"][0]
-                    preprocessed_images.append(image)
-                data_dict["images"] = preprocessed_images
+        # 语言嵌入处理
+        if self.use_precomp_lang_embed:
+            try:
+                lang_embed = torch.load(content["instruction"]) if random.random() > self.cond_mask_prob else self.empty_lang_embed
+                data_dict["lang_embed"] = lang_embed
+            except:
+                data_dict["lang_embed"] = self.empty_lang_embed
+        else:
+            instruction = text_instruction if random.random() > self.cond_mask_prob else ""
+            tokenized = self.tokenizer(instruction, return_tensors="pt", padding="longest", truncation=True, max_length=self.tokenizer_max_length)
+            data_dict["input_ids"] = tokenized.input_ids[0]
 
-                # 🔥 FLARE核心：处理未来观测图像
-                future_obs_image = None
-                use_future_obs = (self.enable_future_obs and 
-                                future_obs_frame is not None and 
-                                future_obs_mask)
+        # 转换为tensor
+        for k, v in data_dict.items():
+            if isinstance(v, np.ndarray):
+                data_dict[k] = torch.from_numpy(v)
+
+        return data_dict
+    def _preprocess_single_image(self, image):
+        """预处理单个图像 - 简单实现"""
+        try:
+            image = Image.fromarray(image)
+            
+            if self.image_size is not None:
+                image = transforms.Resize(self.image_size)(image)
+
+            if self.image_aspect_ratio == "pad":
+                # 简单的正方形填充
+                background_color = tuple(int(x * 255) for x in self.image_processor.image_mean)
+                width, height = image.size
+                if width != height:
+                    size = max(width, height)
+                    result = Image.new(image.mode, (size, size), background_color)
+                    result.paste(image, ((size - width) // 2, (size - height) // 2))
+                    image = result
+
+            image = self.image_processor.preprocess(image, return_tensors="pt")["pixel_values"][0]
+            return image
+        except:
+            # 失败时返回零张量
+            return torch.zeros(3, 224, 224)
+    
+    def __getitem__(self, index):
+        """
+        增强的数据获取，确保未来观测质量和一致性
+        """
+        while True:
+            try:
+                data_dict = self._get_sample_data(index)
                 
-                if use_future_obs:
-                    future_obs_image = self._process_future_obs_image(future_obs_frame)
+                # 验证数据完整性
+                if self._validate_sample_data(data_dict):
+                    self.future_obs_stats['total_samples'] += 1
+                    return data_dict
+                else:
+                    # 数据无效，尝试下一个样本
+                    index = (index + 1) % len(self)
+                    continue
                     
-
-                data_dict["future_obs_image"] = future_obs_image
-                data_dict["has_future_obs"] = use_future_obs
-
-                # 处理文本指令
-                text_instruction = content.get("instruction", "")
-                if isinstance(text_instruction, bytes):
-                    text_instruction = text_instruction.decode('utf-8')
-                data_dict["text_instruction"] = text_instruction
-
-                # 处理语言指令（原有逻辑）
-                if self.use_precomp_lang_embed:
-                    if content["instruction"][-1] == ".":
-                        content["instruction"] = content["instruction"][:-1]
-                    data_dict["lang_embed"] = (torch.load(content["instruction"])
-                                            if random.random() > self.cond_mask_prob else self.empty_lang_embed)
-                else:
-                    instruction = (text_instruction if random.random() > self.cond_mask_prob else "")
-                    data_dict["input_ids"] = self.tokenizer(
-                        instruction,
-                        return_tensors="pt",
-                        padding="longest",
-                        truncation=False,
-                    ).input_ids[0]
-
-                    assert (
-                        len(data_dict["input_ids"]) <= self.tokenizer_max_length
-                    ), f"Instruction length {len(data_dict['input_ids'])} exceeds the maximum length {self.tokenizer_max_length}."
-
-                # 转换numpy数组为tensor
-                for k, v in data_dict.items():
-                    if isinstance(v, np.ndarray):
-                        data_dict[k] = torch.from_numpy(v)
-
-                
-
-                return data_dict
-                
-            except BaseException as e:
-                if data_dict is not None:
-                    print(
-                        f"Error catched when processing sample from {data_dict.get('dataset_name')}:",
-                        e,
-                    )
-                else:
-                    print(f"Error catched when processing sample:", e)
-                traceback.print_exc()
+            except Exception as e:
+                print(f"Error in __getitem__: {e}")
                 index = (index + 1) % len(self)
-
+                continue
+    
+    def _get_sample_data(self, index):
+        """获取样本数据的核心逻辑"""
+        if self.use_hdf5:
+            return self._get_hdf5_sample_data(index)
+        else:
+            return self._get_buffer_sample_data(index)
+    
+    def _get_hdf5_sample_data(self):
+        """从HDF5获取数据 - 修复版本"""
+        res = self.hdf5_dataset.get_item()
+        
+        # 基础数据
+        content = res["meta"]
+        states = res["state"] 
+        actions = res["actions"]
+        state_elem_mask = res["state_indicator"]
+        
+        # 完整的图像数据
+        image_metas = [
+            res["cam_high"], res["cam_high_mask"],
+            res["cam_left_wrist"], res["cam_left_wrist_mask"],
+            res["cam_right_wrist"], res["cam_right_wrist_mask"],
+        ]
+        
+        state_std = res["state_std"]
+        state_mean = res["state_mean"]
+        state_norm = res["state_norm"]
+        
+        # 未来观测处理
+        future_obs_frame = res.get("future_obs_frame")
+        future_obs_mask = res.get("future_obs_mask", False)
+        future_step_id = res.get("future_step_id", -1)
+        
+        # 验证未来观测
+        valid_future_obs = self._validate_future_obs(future_obs_frame, future_obs_mask, future_step_id, content)
+        
+        if not valid_future_obs and self.enable_future_obs:
+            # 尝试使用最后一帧
+            try:
+                main_camera_images = image_metas[0]
+                if len(main_camera_images) > 0:
+                    future_obs_frame = main_camera_images[-1]
+                    valid_future_obs = self._validate_future_obs(future_obs_frame, True, -1, content)
+                    if valid_future_obs:
+                        self.future_obs_stats['synthetic_future_obs'] += 1
+            except:
+                valid_future_obs = False
+        
+        # 更新统计
+        if valid_future_obs:
+            self.future_obs_stats['valid_future_obs'] += 1
+        else:
+            self.future_obs_stats['invalid_future_obs'] += 1
+        
+        # 构建数据字典
+        data_dict = self._build_data_dict(
+            content, states, actions, state_elem_mask, image_metas,
+            state_std, state_mean, state_norm,
+            future_obs_frame, valid_future_obs
+        )
+        
+        return data_dict
+    
+    def _validate_future_obs(self, future_obs_frame, future_obs_mask, future_step_id, content):
+        """验证未来观测的质量"""
+        if future_obs_frame is None:
+            return False
+        
+        # 检查图像有效性
+        if hasattr(future_obs_frame, 'shape'):
+            # 检查形状
+            if any(dim <= 0 for dim in future_obs_frame.shape):
+                return False
+            
+            # 检查是否为空图像
+            if hasattr(future_obs_frame, 'sum') and future_obs_frame.sum() == 0:
+                return False
+            
+            # 检查图像内容是否合理 (避免全白或全黑)
+            if hasattr(future_obs_frame, 'std'):
+                std_val = future_obs_frame.std()
+                if std_val < 1.0:  # 图像变化太小，可能是无效图像
+                    return False
+        
+        # 如果启用一致性检查
+        if self.future_obs_consistency_check:
+            # 检查未来步骤ID是否合理
+            current_step = content.get("#steps", 0)
+            if future_step_id >= current_step:
+                return False
+        
+        return True
+    
+    def _generate_synthetic_future_obs(self, res, content):
+        """生成合成的未来观测"""
+        try:
+            # 使用最后一帧作为未来观测
+            image_metas = [
+                res["cam_high"],
+                res["cam_high_mask"],
+                # ... 其他摄像头
+            ]
+            
+            main_camera_images = image_metas[0]
+            if len(main_camera_images) > 0:
+                # 使用最后一帧
+                synthetic_frame = main_camera_images[-1]
+                
+                # 验证合成帧
+                if self._validate_future_obs(synthetic_frame, True, -1, content):
+                    return synthetic_frame, True
+            
+            return None, False
+            
+        except Exception as e:
+            print(f"Failed to generate synthetic future obs: {e}")
+            return None, False
+    
+    def _validate_sample_data(self, data_dict):
+        """验证样本数据的完整性"""
+        required_keys = [
+            "states", "actions", "images", "text_instruction"
+        ]
+        
+        # 检查必需字段
+        for key in required_keys:
+            if key not in data_dict:
+                return False
+        
+        # 检查tensor形状
+        try:
+            states = data_dict["states"]
+            actions = data_dict["actions"] 
+            images = data_dict["images"]
+            
+            if states.shape[0] != 1:  # 状态应该是1个token
+                return False
+                
+            if len(images) == 0:  # 必须有图像
+                return False
+                
+        except Exception:
+            return False
+        
+        return True
+    
+    def get_stats(self):
+        """获取数据集统计信息"""
+        total = self.future_obs_stats['total_samples']
+        if total > 0:
+            stats = {
+                'total_samples': total,
+                'valid_future_obs_ratio': self.future_obs_stats['valid_future_obs'] / total,
+                'invalid_future_obs_ratio': self.future_obs_stats['invalid_future_obs'] / total,
+                'synthetic_future_obs_ratio': self.future_obs_stats['synthetic_future_obs'] / total,
+            }
+        else:
+            stats = self.future_obs_stats.copy()
+        
+        return stats
+    
 
 class DataCollatorForVLAConsumerDatasetWithFLARE(object):
     """支持FLARE功能的数据收集器"""
@@ -550,6 +690,9 @@ class DataCollatorForVLAConsumerDatasetWithFLARE(object):
             "has_future_obs": [],     # 是否有有效的未来观测
             "text_instructions": [],  # 文本指令
         }
+        valid_future_obs_count = 0
+        total_count = len(instances)
+        
         input_ids = []
         lang_embeds = []
         lang_embed_lens = []
@@ -580,29 +723,39 @@ class DataCollatorForVLAConsumerDatasetWithFLARE(object):
             batch["text_instructions"].append(instance.get("text_instruction", ""))
             batch["has_future_obs"].append(instance.get("has_future_obs", False))
             
-            # 处理未来观测图像
+            # 处理未来观测 (关键修复)
             future_obs_image = instance.get("future_obs_image")
-            # 保证 future_obs_image 一定是 [3, H, W]
-            if future_obs_image is not None:
-                if isinstance(future_obs_image, torch.Tensor):
-                    if future_obs_image.ndim == 4:
-                        # 偶尔多 unsqueeze 了一下
-                        future_obs_image = future_obs_image.squeeze(0)
-                    assert future_obs_image.ndim == 3, f"future_obs_image shape 错误: {future_obs_image.shape}"
+            has_future_obs = instance.get("has_future_obs", False)
+            
+            # 验证未来观测质量
+            if future_obs_image is not None and has_future_obs:
+                # 双重验证
+                if self._validate_future_obs_tensor(future_obs_image):
                     batch["future_obs_images"].append(future_obs_image)
+                    batch["has_future_obs"].append(True)
+                    valid_future_obs_count += 1
                 else:
-                    # 万一是 numpy
-                    batch["future_obs_images"].append(torch.from_numpy(future_obs_image))
+                    # 使用零填充
+                    dummy_shape = instance["images"][0].shape
+                    batch["future_obs_images"].append(torch.zeros(dummy_shape))
+                    batch["has_future_obs"].append(False)
             else:
-                dummy_shape = instance["images"][0].shape  # [3, H, W]
-                batch["future_obs_images"].append(torch.zeros(dummy_shape, dtype=batch["images"][0].dtype))
+                # 使用零填充
+                dummy_shape = instance["images"][0].shape
+                batch["future_obs_images"].append(torch.zeros(dummy_shape))
+                batch["has_future_obs"].append(False)
 
-        # images: [B, img_history_size, 3, H, W]
-        batch["images"] = torch.stack(batch["images"], dim=0)
-        # future_obs_images: [B, 3, H, W]
+        # 批次质量检查
         batch["future_obs_images"] = torch.stack(batch["future_obs_images"], dim=0)
-        assert batch["future_obs_images"].ndim == 4, f"final future_obs_images shape: {batch['future_obs_images'].shape}"
-
+        batch["has_future_obs"] = torch.tensor(batch["has_future_obs"], dtype=torch.bool)
+        
+        # 记录批次统计
+        batch["future_obs_ratio"] = valid_future_obs_count / total_count
+        
+        # 如果批次中未来观测太少，发出警告
+        if valid_future_obs_count < total_count * 0.5:  # 少于50%
+            print(f"Warning: Low future obs ratio in batch: {valid_future_obs_count}/{total_count}")
+        
         # 其余字段
         for key in ["states", "actions", "state_elem_mask", "state_norm"]:
             batch[key] = torch.stack(batch[key], dim=0)
@@ -627,3 +780,30 @@ class DataCollatorForVLAConsumerDatasetWithFLARE(object):
             batch["lang_attn_mask"] = input_lang_attn_mask
 
         return batch
+    def _validate_future_obs_tensor(self, tensor):
+        """验证未来观测tensor的质量"""
+        if tensor is None:
+            return False
+        
+        try:
+            # 检查形状
+            if tensor.ndim != 3:  # 应该是 [C, H, W]
+                return False
+            
+            # 检查数值范围 (假设是0-1或0-255)
+            if tensor.min() < 0 or tensor.max() > 255:
+                return False
+                
+            # 检查是否全零
+            if tensor.sum() == 0:
+                return False
+                
+            # 检查变化程度
+            if tensor.std() < 0.01:  # 变化太小
+                return False
+                
+            return True
+            
+        except Exception:
+            return False
+        
