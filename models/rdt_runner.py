@@ -209,25 +209,42 @@ class RDTRunnerWithFLARE(nn.Module, CompatiblePyTorchModelHubMixin):
 
     def compute_loss_with_flare(self, lang_tokens, lang_attn_mask, img_tokens, state_tokens, 
                             action_gt, action_mask, ctrl_freqs, future_vision_tokens=None, 
-                            text_instructions=None, has_future_obs=None):
+                            text_instructions=None, has_future_obs=None,
+                            future_obs_images=None):
         """
-        计算FLARE增强的损失 - 修复device变量错误
+        计算FLARE增强的损失 - 优化版本
         """
-        # 🔧 修复：首先定义基础变量
-        batch_size = lang_tokens.shape[0]
-        device = lang_tokens.device  # 🔧 关键修复：先定义device
-        
-        # 🔧 获取目标数据类型
+        # 🔧 统一设备和数据类型处理
+        device = next(self.model.parameters()).device  # 获取模型设备
         target_dtype = torch.bfloat16  # 明确使用BF16
+        batch_size = lang_tokens.shape[0]
         
-        # 🔧 确保所有输入数据使用一致的数据类型和设备
-        lang_tokens = lang_tokens.to(dtype=target_dtype, device=device)
-        img_tokens = img_tokens.to(dtype=target_dtype, device=device)
-        state_tokens = state_tokens.to(dtype=target_dtype, device=device)
-        action_gt = action_gt.to(dtype=target_dtype, device=device)
-        action_mask = action_mask.to(dtype=target_dtype, device=device)
-        if future_vision_tokens is not None:
-            future_vision_tokens = future_vision_tokens.to(dtype=target_dtype, device=device)
+        # 🔧 统一将所有输入移动到正确设备和数据类型
+        def to_device_dtype(tensor, device, dtype):
+            """统一的设备和数据类型转换"""
+            if tensor is not None:
+                return tensor.to(dtype=dtype, device=device)
+            return tensor
+        
+        # 转换所有张量输入
+        lang_tokens = to_device_dtype(lang_tokens, device, target_dtype)
+        img_tokens = to_device_dtype(img_tokens, device, target_dtype)
+        state_tokens = to_device_dtype(state_tokens, device, target_dtype)
+        action_gt = to_device_dtype(action_gt, device, target_dtype)
+        action_mask = to_device_dtype(action_mask, device, target_dtype)
+        future_vision_tokens = to_device_dtype(future_vision_tokens, device, target_dtype)
+        future_obs_images = to_device_dtype(future_obs_images, device, target_dtype)
+        
+        # 处理text_instructions（可能是字符串列表或张量）
+        if text_instructions is not None:
+            if isinstance(text_instructions, torch.Tensor):
+                text_instructions = text_instructions.to(device)
+            # 如果是字符串列表，保持不变
+            
+        
+        # 🔧 确保ctrl_freqs也在正确设备上
+        if isinstance(ctrl_freqs, torch.Tensor):
+            ctrl_freqs = ctrl_freqs.to(dtype=target_dtype, device=device)
         
         # 在autocast范围内进行计算
         with torch.autocast(device_type='cuda', dtype=target_dtype):
@@ -238,56 +255,76 @@ class RDTRunnerWithFLARE(nn.Module, CompatiblePyTorchModelHubMixin):
 
             # 拼接状态和动作token
             state_action_traj = torch.cat([state_tokens, noisy_action], dim=1)
-            action_mask = action_mask.expand(-1, state_action_traj.shape[1], -1)
-            state_action_traj = torch.cat([state_action_traj, action_mask], dim=2)
+            action_mask_expanded = action_mask.expand(-1, state_action_traj.shape[1], -1)
+            state_action_traj = torch.cat([state_action_traj, action_mask_expanded], dim=2)
             
-            # 适配条件（adapt_conditions现在会处理类型转换）
+            # 适配条件
             adapted_results = self.adapt_conditions(lang_tokens, img_tokens, state_action_traj, future_vision_tokens)
             lang_cond, img_cond, state_action_traj = adapted_results[:3]
             adapted_future_vision = adapted_results[3] if len(adapted_results) > 3 else None
             
-            # 准备未来观测数据
-            use_flare = (self.enable_flare and 
-                        adapted_future_vision is not None and 
-                        text_instructions is not None)
+            # 🔧 改进的FLARE使用判断逻辑
+            use_flare = (
+                self.enable_flare and 
+                future_obs_images is not None and  # 使用原始图像而不是vision tokens
+                text_instructions is not None
+            )
             
+            # 进一步检查has_future_obs
             if use_flare and has_future_obs is not None:
-                # 只对有有效未来观测的样本使用FLARE
                 valid_indices = has_future_obs.bool()
                 if valid_indices.sum() == 0:
                     use_flare = False
             
-            # 模型前向传播
-            if use_flare:
-                # 使用FLARE增强的模型
-                pred, alignment_loss = self.model(
-                    state_action_traj, ctrl_freqs, timesteps, lang_cond, img_cond, 
-                    lang_mask=lang_attn_mask, 
-                    img_mask=None,
-                    future_vision_tokens=adapted_future_vision,
-                    text_instructions=text_instructions, 
-                    return_alignment_loss=True
-                )
-                
-                # 如果只有部分样本有未来观测，需要处理对齐损失
-                if has_future_obs is not None and has_future_obs.sum() < batch_size:
-                    # 对齐损失只应用于有未来观测的样本
-                    valid_count = has_future_obs.sum().float()
-                    if valid_count > 0:
-                        alignment_loss = alignment_loss * (batch_size / valid_count)
-                    else:
-                        alignment_loss = torch.tensor(0.0, device=device, dtype=target_dtype)
-            else:
-                # 标准扩散模型
-                pred = self.model(
-                    state_action_traj, ctrl_freqs, timesteps, lang_cond, img_cond,
-                    lang_mask=lang_attn_mask,
-                    img_mask=None,
-                    future_vision_tokens=None,
-                    text_instructions=None,
-                    return_alignment_loss=False
-                )
-                alignment_loss = torch.tensor(0.0, device=device, dtype=target_dtype)
+            # 🔧 模型前向传播 - 简化逻辑
+            try:
+                if use_flare:
+                    # 使用FLARE增强的模型
+                    pred, alignment_loss = self.model(
+                        state_action_traj, 
+                        ctrl_freqs, 
+                        timesteps, 
+                        lang_cond, 
+                        img_cond, 
+                        lang_mask=lang_attn_mask, 
+                        img_mask=None,
+                        future_vision_tokens=adapted_future_vision,
+                        text_instructions=text_instructions, 
+                        future_obs_image=future_obs_images,
+                        return_alignment_loss=True
+                    )
+                else:
+                    # 标准扩散模型
+                    pred = self.model(
+                        state_action_traj, 
+                        ctrl_freqs, 
+                        timesteps, 
+                        lang_cond, 
+                        img_cond,
+                        lang_mask=lang_attn_mask,
+                        img_mask=None,
+                        future_vision_tokens=None,
+                        text_instructions=None,
+                        future_obs_image=None,  # 🔧 标准模式不使用未来观测
+                        return_alignment_loss=False
+                    )
+                    alignment_loss = torch.tensor(0.0, device=device, dtype=target_dtype)
+                    
+            except Exception as e:
+                print(f"❌ 模型前向传播失败: {e}")
+                print(f"   use_flare: {use_flare}")
+                print(f"   future_obs_images: {future_obs_images.shape if future_obs_images is not None else None}")
+                print(f"   text_instructions: {type(text_instructions)}")
+                raise e
+
+            # 🔧 对齐损失的处理
+            if use_flare and alignment_loss is not None and has_future_obs is not None:
+                valid_count = has_future_obs.sum().float()
+                if valid_count > 0 and valid_count < batch_size:
+                    # 只对有效样本进行归一化
+                    alignment_loss = alignment_loss * (batch_size / valid_count)
+                elif valid_count == 0:
+                    alignment_loss = torch.tensor(0.0, device=device, dtype=target_dtype)
 
             # 计算目标
             if self.prediction_type == 'epsilon':
@@ -312,6 +349,8 @@ class RDTRunnerWithFLARE(nn.Module, CompatiblePyTorchModelHubMixin):
             'total_loss': total_loss.item(),
             'alignment_loss_weight': self.alignment_loss_weight,
             'used_flare': use_flare,
+            'batch_size': batch_size,
+            'valid_future_obs': has_future_obs.sum().item() if has_future_obs is not None else 0,
         }
         
         return total_loss, loss_dict

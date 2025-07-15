@@ -221,7 +221,7 @@ class RDTWithFLARE(nn.Module):
         return loss
 
     def forward(self, x, freq, t, lang_c, img_c, lang_mask=None, img_mask=None, 
-                future_vision_tokens=None, text_instructions=None, return_alignment_loss=False):
+                future_vision_tokens=None, text_instructions=None, future_obs_image=None, return_alignment_loss=False):
         """
         FLARE模型前向传播
         
@@ -280,15 +280,14 @@ class RDTWithFLARE(nn.Module):
             try:
                 # 1. 生成VL tokens
                 vl_tokens, vl_mask = self.vl_token_generator(
-                    future_vision_tokens, text_instructions
+                    future_obs_image, text_instructions
                 )
                 
                 # 2. 生成目标tokens
                 target_future_tokens = self.target_generator(vl_tokens, vl_mask)
                 
             except Exception as e:
-                print(f"Warning: FLARE target generation failed: {e}")
-                target_future_tokens = None
+                raise  # 直接让程序崩溃，打印完整Traceback
 
         # 通过transformer blocks
         conds = [lang_c, img_c]

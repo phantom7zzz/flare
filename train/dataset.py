@@ -241,8 +241,19 @@ class VLAConsumerDatasetWithFLARE(Dataset):
     def _process_future_obs_image(self, future_obs_frame):
         """处理未来观测图像"""
         try:
-            if future_obs_frame is None or math.prod(future_obs_frame.shape) == 0:
+            if future_obs_frame is None:
                 return None
+            
+            # 检查图像是否为空（形状为0或全零）
+            if hasattr(future_obs_frame, 'shape'):
+                if any(dim == 0 for dim in future_obs_frame.shape):
+                    print("⚠️  未来观测图像形状包含0维度")
+                    return None
+                
+            # 检查是否为全零图像
+                if hasattr(future_obs_frame, 'sum') and future_obs_frame.sum() == 0:
+                    print("⚠️  未来观测图像为全零")
+                    return None
                 
             # 转换为PIL图像
             future_image = Image.fromarray(future_obs_frame)
@@ -299,8 +310,10 @@ class VLAConsumerDatasetWithFLARE(Dataset):
         else:
             return self.num_chunks * self.chunk_size
 
+    # train/dataset.py - 关键修复部分
+
     def __getitem__(self, index):
-        """获取数据项，包含FLARE的动态未来观测"""
+        """获取数据项,包含FLARE的动态未来观测"""
         while True:
             data_dict = None
             try:
@@ -322,14 +335,19 @@ class VLAConsumerDatasetWithFLARE(Dataset):
                     state_mean = res["state_mean"]
                     state_norm = res["state_norm"]
                     
-                    # HDF5暂时不支持动态未来观测计算，设为None
+                    # 🔥 修复：从HDF5正确获取未来观测数据
                     future_obs_frame = res.get("future_obs_frame")
                     future_obs_mask = res.get("future_obs_mask", False)
-                    # 确保有有效的未来观测数据
-                    if future_obs_frame is not None and future_obs_mask:
-                        print(f"✅ HDF5 future obs available: {future_obs_frame.shape}")
-                    else:
-                        print(f"⚠️  HDF5 future obs not available")
+                    future_step_id = res.get("future_step_id", -1)
+                    # 只要有图像数据就认为有效，不再严格要求在action chunk范围内
+                    if future_obs_frame is not None:
+                        # 检查图像是否有有效内容
+                        if hasattr(future_obs_frame, 'shape') and future_obs_frame.shape[0] > 0:
+                            future_obs_mask = True  # 强制设为有效
+                            #print(f"🔥 重新评估未来观测为有效: shape={future_obs_frame.shape}")
+                        else:
+                            print(f"⚠️  未来观测图像无效: shape={getattr(future_obs_frame, 'shape', 'None')}")
+                    
                     
                 else:
                     # 从buffer加载数据
@@ -365,7 +383,7 @@ class VLAConsumerDatasetWithFLARE(Dataset):
                 data_dict["dataset_name"] = content["dataset_name"]
                 data_dict["data_idx"] = self.dataset_name2id[data_dict["dataset_name"]]
                 data_dict["ctrl_freq"] = (self.control_freq[data_dict["dataset_name"]]
-                                          if random.random() > self.cond_mask_prob else 0)
+                                        if random.random() > self.cond_mask_prob else 0)
 
                 # 状态噪声处理（保持原逻辑）
                 if self.state_noise_snr is not None:
@@ -430,7 +448,7 @@ class VLAConsumerDatasetWithFLARE(Dataset):
                         aug_type = random.choice(["corrput_only", "color_only", "both"])
                         if aug_type != "corrput_only":
                             image = transforms.ColorJitter(brightness=0.3, contrast=0.4, saturation=0.5,
-                                                           hue=0.03)(image)
+                                                        hue=0.03)(image)
                         if aug_type != "color_only":
                             image = image_corrupt(image)
 
@@ -454,15 +472,15 @@ class VLAConsumerDatasetWithFLARE(Dataset):
                     preprocessed_images.append(image)
                 data_dict["images"] = preprocessed_images
 
-                # FLARE核心：处理未来观测图像
+                # 🔥 FLARE核心：处理未来观测图像
                 future_obs_image = None
                 use_future_obs = (self.enable_future_obs and 
-                                  future_obs_frame is not None and 
-                                  future_obs_mask and 
-                                  random.random() < self.future_obs_prob)
+                                future_obs_frame is not None and 
+                                future_obs_mask)
                 
                 if use_future_obs:
                     future_obs_image = self._process_future_obs_image(future_obs_frame)
+                    
 
                 data_dict["future_obs_image"] = future_obs_image
                 data_dict["has_future_obs"] = use_future_obs
@@ -478,7 +496,7 @@ class VLAConsumerDatasetWithFLARE(Dataset):
                     if content["instruction"][-1] == ".":
                         content["instruction"] = content["instruction"][:-1]
                     data_dict["lang_embed"] = (torch.load(content["instruction"])
-                                               if random.random() > self.cond_mask_prob else self.empty_lang_embed)
+                                            if random.random() > self.cond_mask_prob else self.empty_lang_embed)
                 else:
                     instruction = (text_instruction if random.random() > self.cond_mask_prob else "")
                     data_dict["input_ids"] = self.tokenizer(
@@ -496,6 +514,8 @@ class VLAConsumerDatasetWithFLARE(Dataset):
                 for k, v in data_dict.items():
                     if isinstance(v, np.ndarray):
                         data_dict[k] = torch.from_numpy(v)
+
+                
 
                 return data_dict
                 
@@ -517,7 +537,7 @@ class DataCollatorForVLAConsumerDatasetWithFLARE(object):
     def __init__(self, tokenizer: transformers.PreTrainedTokenizer) -> None:
         self.tokenizer = tokenizer
 
-    def __call__(self, instances: Sequence[Dict]) -> Dict[str, torch.Tensor]:
+    def __call__(self, instances):
         batch = {
             "states": [],
             "actions": [],
@@ -543,10 +563,9 @@ class DataCollatorForVLAConsumerDatasetWithFLARE(object):
                 "state_norm",
             ]
             for key in keys_to_check:
-                if isinstance(instance[key], torch.Tensor):
-                    item = instance[key]
-                else:
-                    item = torch.from_numpy(instance[key])
+                item = instance[key]
+                if not isinstance(item, torch.Tensor):
+                    item = torch.from_numpy(item)
                 batch[key].append(item)
 
             if "input_ids" in instance:
@@ -563,26 +582,40 @@ class DataCollatorForVLAConsumerDatasetWithFLARE(object):
             
             # 处理未来观测图像
             future_obs_image = instance.get("future_obs_image")
+            # 保证 future_obs_image 一定是 [3, H, W]
             if future_obs_image is not None:
-                batch["future_obs_images"].append(future_obs_image)
+                if isinstance(future_obs_image, torch.Tensor):
+                    if future_obs_image.ndim == 4:
+                        # 偶尔多 unsqueeze 了一下
+                        future_obs_image = future_obs_image.squeeze(0)
+                    assert future_obs_image.ndim == 3, f"future_obs_image shape 错误: {future_obs_image.shape}"
+                    batch["future_obs_images"].append(future_obs_image)
+                else:
+                    # 万一是 numpy
+                    batch["future_obs_images"].append(torch.from_numpy(future_obs_image))
             else:
-                # 使用零张量作为占位符
-                dummy_shape = instance["images"][0].shape
-                batch["future_obs_images"].append(torch.zeros(dummy_shape))
+                dummy_shape = instance["images"][0].shape  # [3, H, W]
+                batch["future_obs_images"].append(torch.zeros(dummy_shape, dtype=batch["images"][0].dtype))
 
-        # 堆叠数据
-        keys_to_stack = ["states", "actions", "state_elem_mask", "state_norm", "images", "future_obs_images"]
-        for key in keys_to_stack:
+        # images: [B, img_history_size, 3, H, W]
+        batch["images"] = torch.stack(batch["images"], dim=0)
+        # future_obs_images: [B, 3, H, W]
+        batch["future_obs_images"] = torch.stack(batch["future_obs_images"], dim=0)
+        assert batch["future_obs_images"].ndim == 4, f"final future_obs_images shape: {batch['future_obs_images'].shape}"
+
+        # 其余字段
+        for key in ["states", "actions", "state_elem_mask", "state_norm"]:
             batch[key] = torch.stack(batch[key], dim=0)
-
         batch["ctrl_freqs"] = torch.tensor(batch["ctrl_freqs"])
         batch["has_future_obs"] = torch.tensor(batch["has_future_obs"], dtype=torch.bool)
 
-        # 处理语言数据
+        # 语言
         if len(input_ids) > 0:
-            input_ids = torch.nn.utils.rnn.pad_sequence(input_ids,
-                                                        batch_first=True,
-                                                        padding_value=self.tokenizer.pad_token_id)
+            input_ids = torch.nn.utils.rnn.pad_sequence(
+                input_ids,
+                batch_first=True,
+                padding_value=self.tokenizer.pad_token_id
+            )
             batch["input_ids"] = input_ids
             batch["lang_attn_mask"] = input_ids.ne(self.tokenizer.pad_token_id)
         else:

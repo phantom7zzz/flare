@@ -607,6 +607,7 @@ def train(args, logger):
                         future_vision_tokens=future_vision_embeds,
                         text_instructions=text_instructions,
                         has_future_obs=has_future_obs,
+                        future_obs_images=batch.get("future_obs_images")
                     )
 
                 # 反向传播（accelerator会自动处理混合精度）

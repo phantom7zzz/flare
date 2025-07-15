@@ -31,16 +31,15 @@ class SigLIP2TextEncoder(nn.Module):
     def forward(self, text_inputs):
         """
         编码文本指令
-        
         Args:
             text_inputs: 文本指令列表或已编码的token ids
-            
         Returns:
             text_embeddings: (B, L, D) 文本嵌入
             text_mask: (B, L) 文本掩码
         """
+        device = next(self.text_model.parameters()).device
+
         if isinstance(text_inputs, list):
-            # 如果输入是文本列表，需要先tokenize
             tokens = self.tokenizer(
                 text_inputs,
                 max_length=self.max_length,
@@ -49,13 +48,12 @@ class SigLIP2TextEncoder(nn.Module):
                 return_tensors="pt",
                 return_attention_mask=True
             )
-            input_ids = tokens.input_ids
-            attention_mask = tokens.attention_mask
+            input_ids = tokens.input_ids.to(device)
+            attention_mask = tokens.attention_mask.to(device)
         else:
-            # 如果已经是token ids
-            input_ids = text_inputs
-            attention_mask = (input_ids != self.tokenizer.pad_token_id).long()
-        
+            input_ids = text_inputs.to(device)
+            attention_mask = (input_ids != self.tokenizer.pad_token_id).long().to(device)
+
         # 获取文本嵌入
         with torch.no_grad():
             text_outputs = self.text_model(
@@ -63,7 +61,7 @@ class SigLIP2TextEncoder(nn.Module):
                 attention_mask=attention_mask
             )
             text_embeddings = text_outputs.last_hidden_state
-        
+
         return text_embeddings, attention_mask.bool()
 
 
@@ -225,9 +223,22 @@ class VLTokenGenerator(nn.Module):
             vl_tokens: (B, N_total, D) 融合后的VL tokens
             vl_mask: (B, N_total) VL tokens的掩码
         """
+        # 🔧 确保所有输入数据在同一设备上
+        device = next(self.parameters()).device  # 获取模型所在设备
+        
+        if future_images is not None:
+            future_images = future_images.to(device)
+        
+        if text_instructions is not None:
+            if isinstance(text_instructions, torch.Tensor):
+                text_instructions = text_instructions.to(device)
+            elif isinstance(text_instructions, list):
+                # 如果是字符串列表，保持不变
+                pass
         batch_size = future_images.shape[0]
         device = future_images.device
-        
+        if future_images is not None and len(future_images.shape) == 3:
+            future_images = future_images.unsqueeze(0)
         # 1. 视觉编码
         vision_features = self.vision_encoder(future_images)  # (B, N_patches, D_vision)
         vision_features = self.vision_proj(vision_features)   # (B, N_patches, hidden_size)
