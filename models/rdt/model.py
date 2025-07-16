@@ -64,7 +64,19 @@ class RDTWithFLARE(nn.Module):
         # 基础RDT组件
         self.t_embedder = TimestepEmbedder(hidden_size, dtype=dtype)
         self.freq_embedder = TimestepEmbedder(hidden_size, dtype=dtype)
-
+        
+        self.vision_feature_adapter = nn.Linear(1152, 2048, bias=False)
+        with torch.no_grad():
+            nn.init.xavier_uniform_(self.vision_feature_adapter.weight)
+        
+        # 确保future_obs_tokens维度正确
+        if hasattr(self, 'future_obs_tokens'):
+            if self.future_obs_tokens.shape[-1] != 2048:
+                self.future_obs_tokens = nn.Parameter(
+                    torch.randn(1, self.num_future_tokens, 2048) * 0.02
+                )
+        
+        print("✅ 维度适配器初始化完成")
         # 位置编码：[timestep; freq; state; action; future_obs]
         #self.x_pos_embed = nn.Parameter(torch.zeros(1, horizon + 3 + num_future_tokens, hidden_size))
         self.state_token_len = 1  # 状态压缩为1个token
@@ -329,7 +341,11 @@ class RDTWithFLARE(nn.Module):
             action_tokens,     # action  
             future_obs_tokens  # future_obs
         ]
-        
+        sequence_parts = [part for part in sequence_parts if part is not None]
+        if not sequence_parts:
+            # 如果所有部分都是None，创建dummy tensor
+            sequence_parts = [torch.zeros(batch_size, 1, 2048, device=device, dtype=dtype)]
+            
         sequence = torch.cat(sequence_parts, dim=1)  # (B, total_seq_len, D)
         
         # 5. 验证序列长度
@@ -415,32 +431,87 @@ class RDTWithFLARE(nn.Module):
             return action_tokens
         
     def _process_future_obs_tokens(self, batch_size, future_obs_image, device, target_dtype):
-        """处理未来观测tokens，确保与实际观测关联"""
+        """处理未来观测tokens """
+
+        
         if future_obs_image is not None:
             try:
-                # 使用VL token生成器的视觉编码器
+                # Step 1: 视觉编码
                 with torch.no_grad():
                     future_vision_features = self.vl_token_generator.vision_encoder(future_obs_image)
                 
-                # 调整特征维度到num_future_tokens
+                # Step 2: 调整token数量
                 if future_vision_features.shape[1] != self.num_future_tokens:
-                    # 使用自适应池化调整尺寸
+
                     future_vision_features = F.adaptive_avg_pool1d(
                         future_vision_features.transpose(1, 2),
                         self.num_future_tokens
                     ).transpose(1, 2)
+
                 
-                # 投影到正确维度
+                # Step 3: 关键的维度修复
+
+                current_dim = future_vision_features.shape[-1]  # 1152
+                target_dim = 2048  # MLP期望的输入维度
+                
+                
+                if current_dim != target_dim:
+                    # 创建维度适配器
+                    if not hasattr(self, 'vision_feature_adapter'):
+                        self.vision_feature_adapter = nn.Linear(
+                            current_dim, 
+                            target_dim,
+                            bias=False  # 可选：不使用偏置
+                        ).to(device=device, dtype=target_dtype)
+                        
+                        # 初始化适配器权重（重要！）
+                        with torch.no_grad():
+                            # 使用Xavier初始化
+                            nn.init.xavier_uniform_(self.vision_feature_adapter.weight)
+                    
+                    # 应用适配器
+                    future_vision_features = self.vision_feature_adapter(future_vision_features)
+                
+                # Step 4: 应用MLP
+                
                 future_obs_tokens = self.future_obs_mlp(future_vision_features)
                 
+                
             except Exception as e:
-                print(f"Warning: Future obs processing failed: {e}")
-                # 降级到随机token
-                future_obs_tokens = self.future_obs_tokens.expand(batch_size, -1, -1)
-                future_obs_tokens = self.future_obs_mlp(future_obs_tokens)
+                print(f"   ❌ 未来观测处理失败: {e}")
+                import traceback
+                traceback.print_exc()
+                
+                # 创建fallback tokens
+                print(f"   🆘 创建fallback tokens")
+                future_obs_tokens = torch.zeros(
+                    batch_size, 
+                    self.num_future_tokens, 
+                    2048,  # 使用MLP的输出维度
+                    device=device, 
+                    dtype=target_dtype
+                )
+                print(f"      Fallback形状: {future_obs_tokens.shape}")
         else:
-            # 使用随机初始化的token
+            print(f"   🔧 使用随机tokens (future_obs_image为None)")
+            
+            # 检查随机tokens的维度是否正确
+            random_token_dim = self.future_obs_tokens.shape[-1]
+            mlp_input_dim = 2048  # 从诊断中得知
+            
+            print(f"      随机token维度: {random_token_dim}")
+            print(f"      MLP期望维度: {mlp_input_dim}")
+            
+            if random_token_dim != mlp_input_dim:
+                print(f"      🔧 重新初始化随机tokens")
+                # 重新创建正确维度的随机tokens
+                self.future_obs_tokens = nn.Parameter(
+                    torch.randn(1, self.num_future_tokens, mlp_input_dim) * 0.02
+                ).to(device=device, dtype=target_dtype)
+            
             future_obs_tokens = self.future_obs_tokens.expand(batch_size, -1, -1)
             future_obs_tokens = self.future_obs_mlp(future_obs_tokens)
+            print(f"      随机tokens输出形状: {future_obs_tokens.shape}")
         
-        return future_obs_tokens.to(device=device, dtype=target_dtype)
+        result = future_obs_tokens.to(device=device, dtype=target_dtype)
+        return result

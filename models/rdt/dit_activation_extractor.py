@@ -74,18 +74,21 @@ class DiTActivationExtractor:
         self.model = model
         self.target_layers = target_layers
         self.num_future_tokens = num_future_tokens
-        # self.token_start_offset = token_start_offset
-        # self.enable_gradient_hooks = enable_gradient_hooks
+        self.token_start_offset = token_start_offset
+        self.enable_gradient_hooks_flag = enable_gradient_hooks
+        
         if hasattr(model, 'indices'):
             self.sequence_indices = model.indices
         else:
             # 兼容旧版本，使用默认计算
             self.sequence_indices = self._compute_default_indices(model)
+        
         # 存储钩子和激活
         self.hooks = {}
         self.hook_handles = []
-        # self.extracted_activations = {}
-        # self.layer_outputs = {}
+        self.extracted_activations = {}
+        self.layer_outputs = {}
+        self._gradient_hooks_enabled = False
         
         # 注册钩子
         self._register_hooks()
@@ -128,12 +131,53 @@ class DiTActivationExtractor:
             handle = dit_blocks[layer_idx].register_forward_hook(hook.forward_hook)
             self.hook_handles.append(handle)
             
-            # 注册反向钩子（可选）
-            if self.enable_gradient_hooks:
-                handle = dit_blocks[layer_idx].register_backward_hook(hook.backward_hook)
+            # 如果初始化时要求启用梯度钩子
+            if self.enable_gradient_hooks_flag:
+                handle = dit_blocks[layer_idx].register_full_backward_hook(hook.backward_hook)
                 self.hook_handles.append(handle)
                 
         print(f"Registered hooks for layers: {self.target_layers}")
+        if self.enable_gradient_hooks_flag:
+            self._gradient_hooks_enabled = True
+    
+    def enable_gradient_hooks(self):
+        """启用梯度钩子"""
+        if self._gradient_hooks_enabled:
+            return
+            
+        try:
+            # 获取DiT blocks
+            if hasattr(self.model, 'blocks'):
+                dit_blocks = self.model.blocks
+            elif hasattr(self.model, 'model') and hasattr(self.model.model, 'blocks'):
+                dit_blocks = self.model.model.blocks
+            else:
+                print("Warning: Cannot find DiT blocks for gradient hooks")
+                return
+            
+            for layer_idx in self.target_layers:
+                if layer_idx >= len(dit_blocks):
+                    continue
+                    
+                layer_name = f"dit_layer_{layer_idx}"
+                if layer_name in self.hooks:
+                    # 为已存在的钩子添加反向钩子
+                    hook = self.hooks[layer_name]
+                    handle = dit_blocks[layer_idx].register_full_backward_hook(hook.backward_hook)
+                    self.hook_handles.append(handle)
+            
+            self._gradient_hooks_enabled = True
+            print(f"✅ 已为层 {self.target_layers} 启用梯度钩子")
+            
+        except Exception as e:
+            print(f"❌ 启用梯度钩子失败: {e}")
+
+    def disable_gradient_hooks(self):
+        """禁用梯度钩子"""
+        # 移除反向钩子（这里简化处理，实际可以更精确地只移除反向钩子）
+        if hasattr(self, '_gradient_hooks_enabled'):
+            self._gradient_hooks_enabled = False
+        print("梯度钩子已禁用")
     
     def extract_future_token_activations(self, layer_idx=6, **kwargs):
         """
@@ -152,7 +196,12 @@ class DiTActivationExtractor:
             return None
         
         # 使用正确的索引范围
-        future_start, future_end = self.sequence_indices['future_obs']
+        if 'future_obs' in self.sequence_indices:
+            future_start, future_end = self.sequence_indices['future_obs']
+        else:
+            # 兜底方案：使用传统计算
+            future_start = self.token_start_offset + kwargs.get('horizon', 32)
+            future_end = future_start + self.num_future_tokens
         
         # 边界检查
         if activation.shape[1] < future_end:
@@ -253,6 +302,14 @@ class DiTActivationExtractor:
         
         return similarity
     
+    def get_extracted_activations(self):
+        """获取提取的激活"""
+        return self.extracted_activations.copy()
+
+    def get_layer_outputs(self):
+        """获取层输出"""
+        return self.layer_outputs.copy()
+    
     def clear_activations(self):
         """清空所有存储的激活"""
         for hook in self.hooks.values():
@@ -263,9 +320,13 @@ class DiTActivationExtractor:
     def remove_hooks(self):
         """移除所有钩子"""
         for handle in self.hook_handles:
-            handle.remove()
+            try:
+                handle.remove()
+            except:
+                pass
         self.hook_handles.clear()
         self.hooks.clear()
+        self._gradient_hooks_enabled = False
         print("All hooks removed")
     
     def __del__(self):
@@ -328,7 +389,8 @@ class FLAREActivationAligner:
         
         # 提取DiT层激活
         pred_tokens = self.activation_extractor.extract_future_token_activations(
-            layer_idx=self.target_layer
+            layer_idx=self.target_layer,
+            horizon=horizon
         )
         
         if pred_tokens is None:
@@ -365,6 +427,8 @@ class FLAREActivationAligner:
             loss = self._cosine_contrastive_loss(pred_tokens, target_tokens)
         elif self.loss_type == "mse":
             loss = F.mse_loss(pred_tokens, target_tokens)
+        elif self.loss_type == "kl_div":
+            loss = self._kl_divergence_loss(pred_tokens, target_tokens)
         else:
             raise ValueError(f"Unknown loss type: {self.loss_type}")
         
@@ -419,15 +483,23 @@ class FLAREActivationAligner:
             return {}
             
         recent_losses = self.loss_history[-100:]  # 最近100步
-        recent_activations = self.activation_history[-100:]
         
+        if not recent_losses:
+            return {}
+            
         metrics = {
             'avg_loss': sum(recent_losses) / len(recent_losses),
             'loss_trend': recent_losses[-1] - recent_losses[0] if len(recent_losses) > 1 else 0,
-            'avg_pred_mean': sum(act['pred_mean'] for act in recent_activations) / len(recent_activations),
-            'avg_target_mean': sum(act['target_mean'] for act in recent_activations) / len(recent_activations),
-            'activation_stability': sum(act['pred_std'] for act in recent_activations) / len(recent_activations)
         }
+        
+        if self.activation_history:
+            recent_activations = self.activation_history[-100:]
+            if recent_activations:
+                metrics.update({
+                    'avg_pred_mean': sum(act.get('pred_mean', 0) for act in recent_activations) / len(recent_activations),
+                    'avg_target_mean': sum(act.get('target_mean', 0) for act in recent_activations) / len(recent_activations),
+                    'activation_stability': sum(act.get('pred_std', 0) for act in recent_activations) / len(recent_activations)
+                })
         
         return metrics
     

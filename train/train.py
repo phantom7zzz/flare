@@ -568,12 +568,14 @@ def train(args, logger):
 
                     # FLARE特定数据
                     future_obs_images = batch.get("future_obs_images")
-                    text_instructions = batch.get("text_instructions", [""] * images.shape[0])
+                    text_instructions = batch.get("text_instructions", [""] * len(images))
                     has_future_obs = batch.get("has_future_obs")
 
                     with torch.no_grad():
                         # 编码图像
-                        batch_size, _, C, H, W = images.shape
+                        images_tensor = torch.stack(images, dim=0)  # [B, num_imgs, C, H, W]
+                        batch_size, _, C, H, W = images_tensor.shape
+                        images = images_tensor  # 更新images变量
                         image_embeds = vision_encoder(images.reshape(-1, C, H, W)).detach()
                         image_embeds = image_embeds.reshape((batch_size, -1, vision_encoder.hidden_size))
 
@@ -831,3 +833,5 @@ def monitor_training_health(loss_dict, global_step, logger):
         logger.info(f"   使用FLARE: {loss_dict.get('used_flare', False)}")
     
     return True
+
+

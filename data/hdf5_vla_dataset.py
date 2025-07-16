@@ -307,12 +307,6 @@ class HDF5VLADataset:
                 cam_right_wrist = parse_img("cam_right_wrist")
                 cam_right_wrist_mask = cam_high_mask.copy()
 
-                # FLARE核心：计算未来观测（移除调试输出）
-                future_step_id, has_valid_future = compute_future_obs_frame(step_id, num_steps)
-                
-                # 获取未来观测图像（使用主摄像头 cam_high）
-                future_obs_frame = parse_img("cam_high", target_step=future_step_id)
-
                 # Return the resulting sample
                 result = {
                     "meta": meta,

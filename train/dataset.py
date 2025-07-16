@@ -220,10 +220,10 @@ class VLAConsumerDatasetWithFLARE(Dataset):
             return None, False
 
     def _compute_future_obs_from_episode_data(self, content, image_metas, current_step_id):
-    """
-    从episode数据动态计算未来观测
-    核心逻辑：未来观测对应action chunk的实际结束帧
-    """
+        """
+        从episode数据动态计算未来观测
+        核心逻辑：未来观测对应action chunk的实际结束帧
+        """
         try:
             # 获取episode总步数
             total_steps = content.get("#steps", len(image_metas[0]))
@@ -328,25 +328,26 @@ class VLAConsumerDatasetWithFLARE(Dataset):
         else:
             return self.num_chunks * self.chunk_size
     def _validate_action_future_obs_consistency(self, actions, future_obs_frame, step_id, content):
-    """
-    验证动作序列和未来观测的一致性
-    确保当动作被填充时，未来观测对应正确的帧
-    """
-    try:
-        total_steps = content.get("#steps", 0)
-        ideal_end_step = step_id + self.action_chunk_size - 1
-        
-        # 检查是否存在动作填充的情况
-        if ideal_end_step >= total_steps:
-            # 应该使用最后一帧作为未来观测
-            expected_future_step = total_steps - 1
-            # 这里可以添加更多验证逻辑
-            return True
-        else:
-            # 完整的action chunk，未来观测应该对应chunk结束帧
-            return True
+        """
+        验证动作序列和未来观测的一致性
+        确保当动作被填充时，未来观测对应正确的帧
+        """
+        try:
+            total_steps = content.get("#steps", 0)
+            ideal_end_step = step_id + self.action_chunk_size - 1
             
-    except Exception:
+            # 检查是否存在动作填充的情况
+            if ideal_end_step >= total_steps:
+                # 应该使用最后一帧作为未来观测
+                expected_future_step = total_steps - 1
+                return True
+            else:
+                # 完整的action chunk，未来观测应该对应chunk结束帧
+                return True
+                
+        except Exception as e:
+            print(f"Error in action-future obs consistency validation: {e}")
+            return False
     # train/dataset.py - 关键修复部分
     def _get_buffer_sample_data(self, index):
         """从buffer获取数据 - 简单修复"""
@@ -414,7 +415,7 @@ class VLAConsumerDatasetWithFLARE(Dataset):
         return data_dict
     def _build_data_dict(self, content, states, actions, state_elem_mask, image_metas,
                      state_std, state_mean, state_norm, future_obs_frame, has_future_obs):
-    """构建数据字典 - 简单实现"""
+        """构建数据字典 - 简单实现"""
     
         data_dict = {}
         data_dict["dataset_name"] = content["dataset_name"]
@@ -460,15 +461,26 @@ class VLAConsumerDatasetWithFLARE(Dataset):
         data_dict["images"] = preprocessed_images
 
         # 处理未来观测图像
+        # future_obs_image = None
+        # if has_future_obs and future_obs_frame is not None:
+        #     future_obs_image = self._process_future_obs_image(future_obs_frame)
+        #     if future_obs_image is None:
+        #         has_future_obs = False
+
+        # data_dict["future_obs_image"] = future_obs_image
+        # data_dict["has_future_obs"] = has_future_obs
         future_obs_image = None
         if has_future_obs and future_obs_frame is not None:
+            #print(f"🔧 开始处理未来观测图像，输入has_future_obs={has_future_obs}")
             future_obs_image = self._process_future_obs_image(future_obs_frame)
+            #print(f"🔧 图像处理结果: {type(future_obs_image)}")
             if future_obs_image is None:
+                #print(f"❌ 图像处理失败！has_future_obs设为False")
                 has_future_obs = False
 
         data_dict["future_obs_image"] = future_obs_image
         data_dict["has_future_obs"] = has_future_obs
-
+        #print(f"🔧 最终输出has_future_obs={has_future_obs}")
         # 处理文本指令
         text_instruction = content.get("instruction", "")
         if isinstance(text_instruction, bytes):
@@ -538,6 +550,7 @@ class VLAConsumerDatasetWithFLARE(Dataset):
                 print(f"Error in __getitem__: {e}")
                 index = (index + 1) % len(self)
                 continue
+
     
     def _get_sample_data(self, index):
         """获取样本数据的核心逻辑"""
@@ -546,9 +559,9 @@ class VLAConsumerDatasetWithFLARE(Dataset):
         else:
             return self._get_buffer_sample_data(index)
     
-    def _get_hdf5_sample_data(self):
+    def _get_hdf5_sample_data(self, index):
         """从HDF5获取数据 - 修复版本"""
-        res = self.hdf5_dataset.get_item()
+        res = self.hdf5_dataset.get_item(index)
         
         # 基础数据
         content = res["meta"]
@@ -741,43 +754,49 @@ class DataCollatorForVLAConsumerDatasetWithFLARE(object):
                     item = torch.from_numpy(item)
                 batch[key].append(item)
 
+            # 处理语言数据
             if "input_ids" in instance:
                 input_ids.append(instance["input_ids"])
             else:
                 lang_embeds.append(instance["lang_embed"])
                 lang_embed_lens.append(instance["lang_embed"].shape[0])
 
+            # 处理图像数据
             batch["images"].append(torch.stack(instance["images"], dim=0))
             batch["data_indices"].append(instance["data_idx"])
             batch["ctrl_freqs"].append(instance["ctrl_freq"])
             batch["text_instructions"].append(instance.get("text_instruction", ""))
-            batch["has_future_obs"].append(instance.get("has_future_obs", False))
             
             # 处理未来观测 (关键修复)
             future_obs_image = instance.get("future_obs_image")
             has_future_obs = instance.get("has_future_obs", False)
             
+            #print(f"📦 样本{len(batch['images'])-1}: 输入has_future_obs={has_future_obs}")
+            
             # 验证未来观测质量
             if future_obs_image is not None and has_future_obs:
+                #print(f"   🔍 进行tensor验证...")
                 # 双重验证
                 if self._validate_future_obs_tensor(future_obs_image):
+                    #print(f"   ✅ tensor验证通过")
                     batch["future_obs_images"].append(future_obs_image)
                     batch["has_future_obs"].append(True)
                     valid_future_obs_count += 1
                 else:
+                    #print(f"   ❌ tensor验证失败")
                     # 使用零填充
                     dummy_shape = instance["images"][0].shape
                     batch["future_obs_images"].append(torch.zeros(dummy_shape))
                     batch["has_future_obs"].append(False)
             else:
+                #print(f"   ⚠️ 未来观测无效 (image={type(future_obs_image)}, has_obs={has_future_obs})")
                 # 使用零填充
                 dummy_shape = instance["images"][0].shape
                 batch["future_obs_images"].append(torch.zeros(dummy_shape))
                 batch["has_future_obs"].append(False)
 
-        # 批次质量检查
+        # 批次质量检查和tensor转换
         batch["future_obs_images"] = torch.stack(batch["future_obs_images"], dim=0)
-        batch["has_future_obs"] = torch.tensor(batch["has_future_obs"], dtype=torch.bool)
         
         # 记录批次统计
         batch["future_obs_ratio"] = valid_future_obs_count / total_count
@@ -786,13 +805,13 @@ class DataCollatorForVLAConsumerDatasetWithFLARE(object):
         if valid_future_obs_count < total_count * 0.5:  # 少于50%
             print(f"Warning: Low future obs ratio in batch: {valid_future_obs_count}/{total_count}")
         
-        # 其余字段
+        # 其余字段转换为tensor
         for key in ["states", "actions", "state_elem_mask", "state_norm"]:
             batch[key] = torch.stack(batch[key], dim=0)
         batch["ctrl_freqs"] = torch.tensor(batch["ctrl_freqs"])
         batch["has_future_obs"] = torch.tensor(batch["has_future_obs"], dtype=torch.bool)
 
-        # 语言
+        # 语言处理
         if len(input_ids) > 0:
             input_ids = torch.nn.utils.rnn.pad_sequence(
                 input_ids,
@@ -811,29 +830,27 @@ class DataCollatorForVLAConsumerDatasetWithFLARE(object):
 
         return batch
     def _validate_future_obs_tensor(self, tensor):
-        """验证未来观测tensor的质量"""
+        """验证未来观测tensor的质量 - 简化版本"""
         if tensor is None:
             return False
         
         try:
-            # 检查形状
-            if tensor.ndim != 3:  # 应该是 [C, H, W]
+            # 基本检查
+            if not hasattr(tensor, 'shape') or tensor.ndim != 3:
                 return False
             
-            # 检查数值范围 (假设是0-1或0-255)
-            if tensor.min() < 0 or tensor.max() > 255:
+            # 只检查是否有意义的变化
+            if tensor.std().item() < 1e-6:
                 return False
                 
-            # 检查是否全零
-            if tensor.sum() == 0:
-                return False
-                
-            # 检查变化程度
-            if tensor.std() < 0.01:  # 变化太小
+            # 检查NaN和Inf
+            if torch.isnan(tensor).any() or torch.isinf(tensor).any():
                 return False
                 
             return True
             
         except Exception:
             return False
+        
+        
         
