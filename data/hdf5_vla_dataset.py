@@ -190,14 +190,18 @@ class HDF5VLADataset:
                 total_dim = left_arm_dim + 1 + right_arm_dim + 1
                 qpos = qpos / np.array([[1 for i in range(total_dim)]])
                 
-                # 检查 action 数据的可用性（静默处理）
-                if step_id + self.CHUNK_SIZE > f["action"].shape[0]:
-                    available_actions = f["action"][step_id:]
-                    # 只在verbose模式下输出警告
-                    if self.verbose:
-                        print(f"⚠️ Action 数据不足，可用: {available_actions.shape[0]}, 需要: {self.CHUNK_SIZE}")
+                available_actions = f["action"][step_id:step_id + self.CHUNK_SIZE]
+                action_chunk_end_step = step_id + available_actions.shape[0] - 1  # 实际动作序列的最后一步
+
+                # 计算未来观测应该对应的步骤
+                if available_actions.shape[0] == self.CHUNK_SIZE:
+                    # 完整的action chunk，未来观测是chunk的最后一步
+                    future_step_id = step_id + self.CHUNK_SIZE - 1
+                    has_valid_future = True
                 else:
-                    available_actions = f["action"][step_id:step_id + self.CHUNK_SIZE]
+                    # 不完整的action chunk，未来观测是episode的最后一步
+                    future_step_id = num_steps - 1
+                    has_valid_future = True  # 仍然有效，只是使用最后一帧
                     
                 target_qpos = available_actions / np.array([[1 for i in range(total_dim)]])
 
@@ -291,13 +295,7 @@ class HDF5VLADataset:
                             return np.zeros((self.IMG_HISORY_SIZE, 480, 640, 3), dtype=np.uint8)
 
                 # 计算未来观测帧的步骤ID（移除调试输出）
-                def compute_future_obs_frame(current_step, total_steps):
-                    """计算未来观测帧的步骤ID"""
-                    future_step = current_step + self.CHUNK_SIZE - 1
-                    if future_step < total_steps:
-                        return future_step, True
-                    else:
-                        return total_steps - 1, True
+                future_obs_frame = parse_img("cam_high", target_step=future_step_id)
 
                 # Parse the images (历史图像)
                 cam_high = parse_img("cam_high")

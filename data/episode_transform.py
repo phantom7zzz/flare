@@ -193,18 +193,23 @@ def flatten_episode_with_flare(episode: dict) -> list:
     main_camera_frames = all_camera_frames["camera_0"]
     
     def get_future_obs_frame(current_step):
-        """
-        获取当前步骤对应的未来观测帧
-        核心逻辑：future_step = current_step + ACTION_CHUNK_SIZE - 1
-        这代表action chunk执行完毕后的观测
-        """
-        future_step = current_step + ACTION_CHUNK_SIZE - 1
-        # 确保不超出轨迹边界
-        future_step = tf.minimum(future_step, total_frames - 1)
+    """
+    获取当前步骤对应的未来观测帧
+    核心逻辑：
+    1. 如果 current_step + ACTION_CHUNK_SIZE - 1 < total_frames，使用该帧
+    2. 否则使用最后一帧，这样与动作填充逻辑保持一致
+    """
+        ideal_future_step = current_step + ACTION_CHUNK_SIZE - 1
+        
+        # 如果理想步骤在范围内，使用它；否则使用最后一帧
+        actual_future_step = tf.minimum(ideal_future_step, total_frames - 1)
+        
         # 获取未来观测帧
-        future_frame = tf.gather(main_camera_frames, future_step)
-        # 检查是否是有效的未来观测（没有超出轨迹边界）
-        is_valid = tf.less(current_step + ACTION_CHUNK_SIZE - 1, total_frames)
+        future_frame = tf.gather(main_camera_frames, actual_future_step)
+        
+        # 所有情况都认为是有效的，因为我们总是能提供一个合理的未来观测
+        is_valid = tf.constant(True)
+        
         return future_frame, is_valid
     
     # 为每个时间步计算未来观测

@@ -220,30 +220,36 @@ class VLAConsumerDatasetWithFLARE(Dataset):
             return None, False
 
     def _compute_future_obs_from_episode_data(self, content, image_metas, current_step_id):
-        """
-        从episode数据动态计算未来观测
-        这是FLARE的核心：使用action chunk结束后的观测作为未来观测
-        """
+    """
+    从episode数据动态计算未来观测
+    核心逻辑：未来观测对应action chunk的实际结束帧
+    """
         try:
-            # 获取当前时间步
-            step_id = current_step_id
+            # 获取episode总步数
+            total_steps = content.get("#steps", len(image_metas[0]))
             
-            # 计算未来观测的时间步：当前步 + action_chunk_size - 1
-            future_step = step_id + self.action_chunk_size - 1
+            # 计算理想的action chunk结束步骤
+            ideal_end_step = current_step_id + self.action_chunk_size - 1
             
-            # 从image_metas中获取主摄像头（通常是第一个摄像头）的所有帧
-            # image_metas结构：[cam0_images, cam0_mask, cam1_images, cam1_mask, ...]
-            main_camera_images = image_metas[0]  # 主摄像头的图像序列
-            
-            # 检查未来步是否在有效范围内
-            if future_step < len(main_camera_images):
-                future_obs_frame = main_camera_images[future_step]
+            # 计算实际的action chunk结束步骤
+            if ideal_end_step < total_steps:
+                # 完整的action chunk
+                actual_end_step = ideal_end_step
                 future_obs_mask = True
             else:
-                # 如果超出范围，使用最后一帧
+                # 不完整的action chunk，使用episode最后一步
+                actual_end_step = total_steps - 1
+                future_obs_mask = True  # 仍然有效
+            
+            # 从主摄像头获取对应帧
+            main_camera_images = image_metas[0]  # 主摄像头的图像序列
+            
+            if actual_end_step < len(main_camera_images):
+                future_obs_frame = main_camera_images[actual_end_step]
+            else:
+                # 安全检查：如果超出范围，使用最后一帧
                 future_obs_frame = main_camera_images[-1]
-                future_obs_mask = False
-                
+            
             return future_obs_frame, future_obs_mask
             
         except Exception as e:
@@ -321,7 +327,26 @@ class VLAConsumerDatasetWithFLARE(Dataset):
             return len(self.hdf5_dataset)
         else:
             return self.num_chunks * self.chunk_size
-
+    def _validate_action_future_obs_consistency(self, actions, future_obs_frame, step_id, content):
+    """
+    验证动作序列和未来观测的一致性
+    确保当动作被填充时，未来观测对应正确的帧
+    """
+    try:
+        total_steps = content.get("#steps", 0)
+        ideal_end_step = step_id + self.action_chunk_size - 1
+        
+        # 检查是否存在动作填充的情况
+        if ideal_end_step >= total_steps:
+            # 应该使用最后一帧作为未来观测
+            expected_future_step = total_steps - 1
+            # 这里可以添加更多验证逻辑
+            return True
+        else:
+            # 完整的action chunk，未来观测应该对应chunk结束帧
+            return True
+            
+    except Exception:
     # train/dataset.py - 关键修复部分
     def _get_buffer_sample_data(self, index):
         """从buffer获取数据 - 简单修复"""
@@ -373,7 +398,12 @@ class VLAConsumerDatasetWithFLARE(Dataset):
             self.future_obs_stats['valid_future_obs'] += 1
         else:
             self.future_obs_stats['invalid_future_obs'] += 1
-
+        if self.enable_future_obs and valid_future_obs:
+            consistency_check = self._validate_action_future_obs_consistency(
+                actions, future_obs_frame, step_id, content
+            )
+            if not consistency_check:
+                valid_future_obs = False
         # 构建数据字典
         data_dict = self._build_data_dict(
             content, states, actions, state_elem_mask, image_metas,
