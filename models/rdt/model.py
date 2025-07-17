@@ -313,6 +313,10 @@ class RDTWithFLARE(nn.Module):
         # x = x + self.x_pos_embed
         # lang_c = lang_c + self.lang_cond_pos_embed[:, :lang_c.shape[1]]
         batch_size = x.shape[0]
+        if t.shape[0] == 1 and batch_size != 1:
+            # 推理/采样时如果t是单元素，扩展成和batch_size一致
+            t = t.expand(batch_size)
+        t_embed = self.t_embedder(t).unsqueeze(1)  # (B, 1, D)
         device = x.device
         target_dtype = self.dtype
         
@@ -344,8 +348,9 @@ class RDTWithFLARE(nn.Module):
         sequence_parts = [part for part in sequence_parts if part is not None]
         if not sequence_parts:
             # 如果所有部分都是None，创建dummy tensor
-            sequence_parts = [torch.zeros(batch_size, 1, 2048, device=device, dtype=dtype)]
-            
+            sequence_parts = [torch.zeros(batch_size, 1, 2048, device=device, dtype=dtype)] 
+        for i, p in enumerate(sequence_parts):
+            assert p.shape[0] == batch_size, f"part {i} batch size {p.shape[0]} != {batch_size}"  
         sequence = torch.cat(sequence_parts, dim=1)  # (B, total_seq_len, D)
         
         # 5. 验证序列长度
@@ -478,12 +483,10 @@ class RDTWithFLARE(nn.Module):
                 
                 
             except Exception as e:
-                print(f"   ❌ 未来观测处理失败: {e}")
                 import traceback
                 traceback.print_exc()
                 
                 # 创建fallback tokens
-                print(f"   🆘 创建fallback tokens")
                 future_obs_tokens = torch.zeros(
                     batch_size, 
                     self.num_future_tokens, 
@@ -491,19 +494,15 @@ class RDTWithFLARE(nn.Module):
                     device=device, 
                     dtype=target_dtype
                 )
-                print(f"      Fallback形状: {future_obs_tokens.shape}")
+
         else:
-            print(f"   🔧 使用随机tokens (future_obs_image为None)")
             
             # 检查随机tokens的维度是否正确
             random_token_dim = self.future_obs_tokens.shape[-1]
-            mlp_input_dim = 2048  # 从诊断中得知
-            
-            print(f"      随机token维度: {random_token_dim}")
-            print(f"      MLP期望维度: {mlp_input_dim}")
+            mlp_input_dim = 2048  
+
             
             if random_token_dim != mlp_input_dim:
-                print(f"      🔧 重新初始化随机tokens")
                 # 重新创建正确维度的随机tokens
                 self.future_obs_tokens = nn.Parameter(
                     torch.randn(1, self.num_future_tokens, mlp_input_dim) * 0.02
@@ -511,7 +510,6 @@ class RDTWithFLARE(nn.Module):
             
             future_obs_tokens = self.future_obs_tokens.expand(batch_size, -1, -1)
             future_obs_tokens = self.future_obs_mlp(future_obs_tokens)
-            print(f"      随机tokens输出形状: {future_obs_tokens.shape}")
         
         result = future_obs_tokens.to(device=device, dtype=target_dtype)
         return result

@@ -16,7 +16,7 @@ sys.path.append(os.path.join(current_file.parent.parent, "models"))
 
 from multimodal_encoder.siglip_encoder import SiglipVisionTower
 from multimodal_encoder.t5_encoder import T5Embedder
-from rdt_runner import RDTRunner
+from rdt_runner import RDTRunnerWithFLARE
 
 # The indices that the raw vector should be mapped to in the unified action vector
 # AGILEX_STATE_INDICES = [
@@ -89,7 +89,7 @@ class RoboticDiffusionTransformerModel(object):
             img_cond_len = (self.args["common"]["img_history_size"] * self.args["common"]["num_cameras"] *
                             self.vision_model.num_patches)
 
-            _model = RDTRunner(
+            _model = RDTRunnerWithFLARE(
                 action_dim=self.args["common"]["state_dim"],
                 pred_horizon=self.args["common"]["action_chunk_size"],
                 config=self.args["model"],
@@ -117,7 +117,7 @@ class RoboticDiffusionTransformerModel(object):
                 dtype=self.dtype,
             )
         else:
-            _model = RDTRunner.from_pretrained(pretrained)
+            _model = RDTRunnerWithFLARE.from_pretrained(pretrained)
 
         return _model
 
@@ -147,20 +147,55 @@ class RoboticDiffusionTransformerModel(object):
         # self.text_model = self.text_model.to(device, dtype=weight_dtype)
         self.vision_model = self.vision_model.to(device, dtype=weight_dtype)
 
+    # def load_pretrained_weights(self, pretrained=None):
+    #     if pretrained is None:
+    #         return
+    #     print(f"Loading weights from {pretrained}")
+    #     filename = os.path.basename(pretrained)
+    #     if filename.endswith(".pt"):
+    #         checkpoint = torch.load(pretrained)
+    #         self.policy.load_state_dict(checkpoint["module"])
+    #     elif filename.endswith(".safetensors"):
+    #         from safetensors.torch import load_model
+
+    #         load_model(self.policy, pretrained)
+    #     else:
+    #         raise NotImplementedError(f"Unknown checkpoint format: {pretrained}")
     def load_pretrained_weights(self, pretrained=None):
         if pretrained is None:
             return
         print(f"Loading weights from {pretrained}")
         filename = os.path.basename(pretrained)
+        
         if filename.endswith(".pt"):
-            checkpoint = torch.load(pretrained)
+            checkpoint = torch.load(pretrained, map_location="cpu")
             self.policy.load_state_dict(checkpoint["module"])
+        elif filename.endswith(".bin"):
+            # 支持 .bin 格式 (HuggingFace 常用格式)
+            checkpoint = torch.load(pretrained, map_location="cpu")
+            # 尝试不同的键名，根据实际模型结构调整
+            if isinstance(checkpoint, dict):
+                if "module" in checkpoint:
+                    self.policy.load_state_dict(checkpoint["module"])
+                elif "model_state_dict" in checkpoint:
+                    self.policy.load_state_dict(checkpoint["model_state_dict"])
+                elif "state_dict" in checkpoint:
+                    self.policy.load_state_dict(checkpoint["state_dict"])
+                else:
+                    # 如果字典中没有预期的键，尝试直接加载整个字典
+                    try:
+                        self.policy.load_state_dict(checkpoint)
+                    except Exception as e:
+                        print(f"Warning: Failed to load state dict directly, available keys: {list(checkpoint.keys())}")
+                        raise e
+            else:
+                # 如果不是字典格式，假设它就是 state_dict
+                self.policy.load_state_dict(checkpoint)
         elif filename.endswith(".safetensors"):
             from safetensors.torch import load_model
-
             load_model(self.policy, pretrained)
         else:
-            raise NotImplementedError(f"Unknown checkpoint format: {pretrained}")
+            raise NotImplementedError(f"Unknown checkpoint format: {pretrained}. Supported formats: .pt, .bin, .safetensors")
 
     def encode_instruction(self, instruction, device="cuda"):
         """Encode string instruction to latent embeddings.

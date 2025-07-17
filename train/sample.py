@@ -30,7 +30,10 @@ def log_sample_res(
             data_indices = batch["data_indices"]
             ctrl_freqs = batch["ctrl_freqs"]
             state_norm = batch["state_norm"].to(dtype=weight_dtype)
-            images = batch["images"].to(dtype=weight_dtype)
+            images = batch["images"]
+            if isinstance(images, list):
+                images = torch.stack(images, dim=0)
+            images = images.to(dtype=weight_dtype)
             states = batch["states"].to(dtype=weight_dtype)
             # We only use the last state as input
             states = states[:, -1:, :]
