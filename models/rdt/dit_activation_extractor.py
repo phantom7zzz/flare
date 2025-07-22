@@ -57,7 +57,7 @@ class DiTActivationExtractor:
     
     def __init__(self, 
                  model: nn.Module,
-                 target_layers: List[int] = [6],
+                 target_layers: List[int] = [21],
                  num_future_tokens: int = 32,
                  token_start_offset: int = 3,  # timestep + freq + state tokens
                  enable_gradient_hooks: bool = False):
@@ -346,7 +346,7 @@ class FLAREActivationAligner:
     
     def __init__(self, 
                  model: nn.Module,
-                 target_layer: int = 6,
+                 target_layer: int = 21,
                  num_future_tokens: int = 32,
                  alignment_temperature: float = 0.07,
                  loss_type: str = "cosine_contrastive"):

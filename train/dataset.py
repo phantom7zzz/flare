@@ -414,9 +414,9 @@ class VLAConsumerDatasetWithFLARE(Dataset):
         
         return data_dict
     def _build_data_dict(self, content, states, actions, state_elem_mask, image_metas,
-                     state_std, state_mean, state_norm, future_obs_frame, has_future_obs):
-        """构建数据字典 - 简单实现"""
-    
+                 state_std, state_mean, state_norm, future_obs_frame, has_future_obs):
+        """构建数据字典 - 统一T5架构完整版"""
+
         data_dict = {}
         data_dict["dataset_name"] = content["dataset_name"]
         data_dict["data_idx"] = self.dataset_name2id.get(data_dict["dataset_name"], 0)
@@ -428,7 +428,7 @@ class VLAConsumerDatasetWithFLARE(Dataset):
         data_dict["state_elem_mask"] = state_elem_mask
         data_dict["state_norm"] = state_norm
 
-        # 处理历史图像（保持您的原有逻辑）
+        # 处理历史图像（保持原有逻辑）
         background_color = np.array([int(x * 255) for x in self.image_processor.image_mean], dtype=np.uint8).reshape(1, 1, 3)
         background_image = np.ones((self.image_processor.size["height"], self.image_processor.size["width"], 3), dtype=np.uint8) * background_color
 
@@ -461,44 +461,45 @@ class VLAConsumerDatasetWithFLARE(Dataset):
         data_dict["images"] = preprocessed_images
 
         # 处理未来观测图像
-        # future_obs_image = None
-        # if has_future_obs and future_obs_frame is not None:
-        #     future_obs_image = self._process_future_obs_image(future_obs_frame)
-        #     if future_obs_image is None:
-        #         has_future_obs = False
-
-        # data_dict["future_obs_image"] = future_obs_image
-        # data_dict["has_future_obs"] = has_future_obs
         future_obs_image = None
         if has_future_obs and future_obs_frame is not None:
-            #print(f"🔧 开始处理未来观测图像，输入has_future_obs={has_future_obs}")
             future_obs_image = self._process_future_obs_image(future_obs_frame)
-            #print(f"🔧 图像处理结果: {type(future_obs_image)}")
             if future_obs_image is None:
-                #print(f"❌ 图像处理失败！has_future_obs设为False")
                 has_future_obs = False
 
         data_dict["future_obs_image"] = future_obs_image
         data_dict["has_future_obs"] = has_future_obs
-        #print(f"🔧 最终输出has_future_obs={has_future_obs}")
-        # 处理文本指令
-        text_instruction = content.get("instruction", "")
-        if isinstance(text_instruction, bytes):
-            text_instruction = text_instruction.decode('utf-8')
-        data_dict["text_instruction"] = text_instruction
 
-        # 语言嵌入处理
+        # 🎯 统一T5文本处理
+        
+        # 1. T5预计算嵌入（用于DiT处理当前状态）
         if self.use_precomp_lang_embed:
             try:
-                lang_embed = torch.load(content["instruction"]) if random.random() > self.cond_mask_prob else self.empty_lang_embed
-                data_dict["lang_embed"] = lang_embed
-            except:
+                t5_embed_path = content.get("instruction", "")
+                if isinstance(t5_embed_path, str) and t5_embed_path.endswith('.pt'):
+                    if random.random() > self.cond_mask_prob:
+                        t5_embed = torch.load(t5_embed_path)
+                    else:
+                        t5_embed = self.empty_lang_embed
+                else:
+                    t5_embed = self.empty_lang_embed
+                data_dict["lang_embed"] = t5_embed
+            except Exception as e:
+                print(f"Error loading T5 embed: {e}")
                 data_dict["lang_embed"] = self.empty_lang_embed
         else:
+            # 🔧 如果不使用预计算嵌入，处理原始文本用于T5
+            text_instruction = content.get("instruction", "")
+            if isinstance(text_instruction, bytes):
+                text_instruction = text_instruction.decode('utf-8')
+            
             instruction = text_instruction if random.random() > self.cond_mask_prob else ""
-            tokenized = self.tokenizer(instruction, return_tensors="pt", padding="longest", truncation=True, max_length=self.tokenizer_max_length)
+            tokenized = self.tokenizer(instruction, return_tensors="pt", padding="longest", 
+                                    truncation=True, max_length=self.tokenizer_max_length)
             data_dict["input_ids"] = tokenized.input_ids[0]
 
+        # 🎯 2. FLARE的T5嵌入路径（关键新增）
+        data_dict["flare_text_embed_path"] = content.get("instruction", "")
         # 转换为tensor
         for k, v in data_dict.items():
             if isinstance(v, np.ndarray):
@@ -673,7 +674,7 @@ class VLAConsumerDatasetWithFLARE(Dataset):
     def _validate_sample_data(self, data_dict):
         """验证样本数据的完整性"""
         required_keys = [
-            "states", "actions", "images", "text_instruction"
+            "states", "actions", "images"
         ]
         
         # 检查必需字段
@@ -697,7 +698,9 @@ class VLAConsumerDatasetWithFLARE(Dataset):
             return False
         
         return True
+
     
+
     def get_stats(self):
         """获取数据集统计信息"""
         total = self.future_obs_stats['total_samples']
@@ -732,6 +735,7 @@ class DataCollatorForVLAConsumerDatasetWithFLARE(object):
             "future_obs_images": [],  # 未来观测图像
             "has_future_obs": [],     # 是否有有效的未来观测
             "text_instructions": [],  # 文本指令
+            "flare_text_embed_paths": [],
         }
         valid_future_obs_count = 0
         total_count = len(instances)
@@ -766,6 +770,9 @@ class DataCollatorForVLAConsumerDatasetWithFLARE(object):
             batch["data_indices"].append(instance["data_idx"])
             batch["ctrl_freqs"].append(instance["ctrl_freq"])
             batch["text_instructions"].append(instance.get("text_instruction", ""))
+            # 🎯 处理文本数据（新增FLARE路径）
+            batch["text_instructions"].append(instance.get("text_instruction", ""))
+            batch["flare_text_embed_paths"].append(instance.get("flare_text_embed_path", ""))
             
             # 处理未来观测 (关键修复)
             future_obs_image = instance.get("future_obs_image")

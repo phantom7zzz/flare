@@ -5,7 +5,7 @@ from collections import OrderedDict
 from pathlib import Path
 import sys
 import os
-
+import traceback
 # 导入所有必要的模块
 from models.rdt.blocks import (FinalLayer, RDTBlock, TimestepEmbedder, get_1d_sincos_pos_embed_from_grid,
                               get_multimodal_cond_pos_embed)
@@ -13,6 +13,135 @@ from models.multimodal_encoder.vl_token_generator import VLTokenGenerator
 from models.multimodal_encoder.qformer_target_generator import QFormerTargetGenerator
 from models.rdt.dit_activation_extractor import FLAREActivationAligner
 
+
+# class RDTWithFLARE(nn.Module):
+#     """
+#     完整集成的FLARE增强RDT模型
+    
+#     功能：
+#     1. 标准的RDT动作预测
+#     2. 未来观测的VL token生成
+#     3. Q-Former目标token生成
+#     4. DiT层激活提取和对齐
+#     5. 联合损失优化
+#     """
+
+#     def __init__(self,
+#                  output_dim=128,
+#                  horizon=32,
+#                  hidden_size=1152,
+#                  depth=28,
+#                  num_heads=16,
+#                  max_lang_cond_len=1024,
+#                  img_cond_len=4096,
+#                  lang_pos_embed_config=None,
+#                  img_pos_embed_config=None,
+#                  dtype=torch.bfloat16,
+#                  # FLARE相关参数
+#                  num_future_tokens=32,
+#                  activation_layer=6,
+#                  num_vl_fusion_layers=4,
+#                  num_qformer_layers=2,
+#                  alignment_temperature=0.07,
+#                  vision_model_name="google/siglip-so400m-patch14-384",
+#                  text_model_name="google/siglip-so400m-patch14-384"):
+#         super().__init__()
+        
+#         # 基础参数
+#         self.horizon = horizon
+#         self.hidden_size = hidden_size
+#         self.max_lang_cond_len = max_lang_cond_len
+#         self.img_cond_len = img_cond_len
+#         self.dtype = dtype
+#         self.lang_pos_embed_config = lang_pos_embed_config
+#         self.img_pos_embed_config = img_pos_embed_config
+        
+#         # FLARE相关参数
+#         self.num_future_tokens = num_future_tokens
+#         self.activation_layer = activation_layer
+#         self.alignment_temperature = alignment_temperature
+
+#         # 基础RDT组件
+#         self.t_embedder = TimestepEmbedder(hidden_size, dtype=dtype)
+#         self.freq_embedder = TimestepEmbedder(hidden_size, dtype=dtype)
+        
+#         self.vision_feature_adapter = nn.Linear(1152, 2048, bias=False)
+#         with torch.no_grad():
+#             nn.init.xavier_uniform_(self.vision_feature_adapter.weight)
+        
+#         # 确保future_obs_tokens维度正确
+#         if hasattr(self, 'future_obs_tokens'):
+#             if self.future_obs_tokens.shape[-1] != 2048:
+#                 self.future_obs_tokens = nn.Parameter(
+#                     torch.randn(1, self.num_future_tokens, 2048) * 0.02
+#                 )
+        
+#         print("✅ 维度适配器初始化完成")
+#         # 位置编码：[timestep; freq; state; action; future_obs]
+#         #self.x_pos_embed = nn.Parameter(torch.zeros(1, horizon + 3 + num_future_tokens, hidden_size))
+#         self.state_token_len = 1  # 状态压缩为1个token
+#         self.seq_structure = {
+#             'timestep': 1,
+#             'freq': 1, 
+#             'state': self.state_token_len,
+#             'action': self.horizon,
+#             'future_obs': self.num_future_tokens
+#         }
+        
+#         # 计算总序列长度
+#         total_seq_len = sum(self.seq_structure.values())
+#         self.x_pos_embed = nn.Parameter(torch.zeros(1, total_seq_len, hidden_size))
+        
+#         # 预计算索引位置
+#         self._compute_sequence_indices()
+        
+        
+        
+        
+        
+#         # 条件位置编码
+#         self.lang_cond_pos_embed = nn.Parameter(torch.zeros(1, max_lang_cond_len, hidden_size))
+#         self.img_cond_pos_embed = nn.Parameter(torch.zeros(1, img_cond_len, hidden_size))
+
+#         # Transformer blocks
+#         self.blocks = nn.ModuleList([RDTBlock(hidden_size, num_heads) for _ in range(depth)])
+#         self.final_layer = FinalLayer(hidden_size, output_dim)
+        
+#         # FLARE组件
+#         # 1. VL Token生成器
+#         self.vl_token_generator = VLTokenGenerator(
+#             vision_model_name=vision_model_name,
+#             text_model_name=text_model_name,
+#             hidden_size=hidden_size,
+#             num_fusion_layers=num_vl_fusion_layers,
+#             num_heads=num_heads
+#         )
+        
+#         # 2. Q-Former目标生成器
+#         self.target_generator = QFormerTargetGenerator(
+#             hidden_size=hidden_size,
+#             num_query_tokens=num_future_tokens,
+#             num_layers=num_qformer_layers,
+#             num_heads=num_heads
+#         )
+        
+#         # 3. 未来观测token初始化
+#         self.future_obs_tokens = nn.Parameter(torch.randn(1, num_future_tokens, hidden_size))
+        
+#         # 4. 未来观测token的MLP处理器
+#         self.future_obs_mlp = nn.Sequential(
+#             nn.Linear(hidden_size, hidden_size * 2),
+#             nn.GELU(),
+#             nn.Linear(hidden_size * 2, hidden_size),
+#             nn.Dropout(0.1),
+#             nn.LayerNorm(hidden_size)
+#         )
+        
+#         # 5. 激活对齐器（延迟初始化，避免循环引用）
+#         self.activation_aligner = None
+        
+#         self.initialize_weights()
+#         self._ensure_bf16_consistency()
 
 class RDTWithFLARE(nn.Module):
     """
@@ -30,7 +159,7 @@ class RDTWithFLARE(nn.Module):
                  output_dim=128,
                  horizon=32,
                  hidden_size=1152,
-                 depth=28,
+                 depth=28,                    # 🎯 默认28层DiT
                  num_heads=16,
                  max_lang_cond_len=1024,
                  img_cond_len=4096,
@@ -39,13 +168,20 @@ class RDTWithFLARE(nn.Module):
                  dtype=torch.bfloat16,
                  # FLARE相关参数
                  num_future_tokens=32,
-                 activation_layer=6,
+                 activation_layer=21,
                  num_vl_fusion_layers=4,
-                 num_qformer_layers=6,
+                 num_qformer_layers=2,        # 🎯 默认2层Q-Former
                  alignment_temperature=0.07,
-                 vision_model_name="google/siglip-so400m-patch14-384",
-                 text_model_name="google/siglip-so400m-patch14-384"):
+                 # 🔧 只接收未来观测编码器参数
+                 future_vision_model_name=None,
+                 future_text_model_name=None,
+                 future_vision_image_size=256):
         super().__init__()
+        
+        print(f"🏗️  创建FLARE-RDT模型:")
+        print(f"   DiT层数: {depth}")
+        print(f"   Q-Former层数: {num_qformer_layers}")
+        print(f"   隐藏维度: {hidden_size}")
         
         # 基础参数
         self.horizon = horizon
@@ -60,7 +196,16 @@ class RDTWithFLARE(nn.Module):
         self.num_future_tokens = num_future_tokens
         self.activation_layer = activation_layer
         self.alignment_temperature = alignment_temperature
-
+        # 🔧 未来观测编码器路径
+        self.future_vision_path = future_vision_model_name or "./models/siglip2-large-patch16-256"
+        self.future_text_path = future_text_model_name or self.future_vision_path
+        self.future_vision_image_size = future_vision_image_size
+        
+        print(f"🔧 RDTWithFLARE 初始化:")
+        print(f"   未来观测视觉模型: {self.future_vision_path}")
+        print(f"   未来观测文本模型: {self.future_text_path}")
+        print(f"   未来图像尺寸: {self.future_vision_image_size}")
+        print(f"   文本最大长度: {max_lang_cond_len}")
         # 基础RDT组件
         self.t_embedder = TimestepEmbedder(hidden_size, dtype=dtype)
         self.freq_embedder = TimestepEmbedder(hidden_size, dtype=dtype)
@@ -77,8 +222,8 @@ class RDTWithFLARE(nn.Module):
                 )
         
         print("✅ 维度适配器初始化完成")
-        # 位置编码：[timestep; freq; state; action; future_obs]
-        #self.x_pos_embed = nn.Parameter(torch.zeros(1, horizon + 3 + num_future_tokens, hidden_size))
+        
+        # 序列结构定义
         self.state_token_len = 1  # 状态压缩为1个token
         self.seq_structure = {
             'timestep': 1,
@@ -95,35 +240,40 @@ class RDTWithFLARE(nn.Module):
         # 预计算索引位置
         self._compute_sequence_indices()
         
-        
-        
-        
-        
         # 条件位置编码
         self.lang_cond_pos_embed = nn.Parameter(torch.zeros(1, max_lang_cond_len, hidden_size))
         self.img_cond_pos_embed = nn.Parameter(torch.zeros(1, img_cond_len, hidden_size))
 
-        # Transformer blocks
+        # 🎯 28层Transformer blocks
+        print(f"🏗️  构建{depth}层DiT blocks...")
         self.blocks = nn.ModuleList([RDTBlock(hidden_size, num_heads) for _ in range(depth)])
+        print(f"✅ {depth}层DiT blocks构建完成")
+        
         self.final_layer = FinalLayer(hidden_size, output_dim)
         
         # FLARE组件
+        print("🏗️  构建FLARE组件...")
+        
         # 1. VL Token生成器
         self.vl_token_generator = VLTokenGenerator(
-            vision_model_name=vision_model_name,
-            text_model_name=text_model_name,
+            vision_model_name=self.future_vision_path,     # SigLIP2-256
+            text_model_name=self.future_text_path,         # SigLIP2-256
             hidden_size=hidden_size,
             num_fusion_layers=num_vl_fusion_layers,
-            num_heads=num_heads
+            num_heads=num_heads,
+            max_text_length=max_lang_cond_len,             # 32
+            image_size=self.future_vision_image_size,      # 256
         )
         
-        # 2. Q-Former目标生成器
+        # 2. 🎯 2层Q-Former目标生成器
+        print(f"🏗️  构建{num_qformer_layers}层Q-Former...")
         self.target_generator = QFormerTargetGenerator(
             hidden_size=hidden_size,
             num_query_tokens=num_future_tokens,
-            num_layers=num_qformer_layers,
+            num_layers=num_qformer_layers,  # 使用2层
             num_heads=num_heads
         )
+        print(f"✅ {num_qformer_layers}层Q-Former构建完成")
         
         # 3. 未来观测token初始化
         self.future_obs_tokens = nn.Parameter(torch.randn(1, num_future_tokens, hidden_size))
@@ -140,8 +290,20 @@ class RDTWithFLARE(nn.Module):
         # 5. 激活对齐器（延迟初始化，避免循环引用）
         self.activation_aligner = None
         
+        print("✅ FLARE组件构建完成")
+        
         self.initialize_weights()
         self._ensure_bf16_consistency()
+        
+        # 模型规模统计
+        total_params = sum(p.numel() for p in self.parameters())
+        dit_params = sum(p.numel() for p in self.blocks.parameters())
+        qformer_params = sum(p.numel() for p in self.target_generator.parameters())
+        
+        print(f"📊 模型参数统计:")
+        print(f"   总参数: {total_params:,}")
+        print(f"   DiT参数: {dit_params:,} ({dit_params/total_params:.1%})")
+        print(f"   Q-Former参数: {qformer_params:,} ({qformer_params/total_params:.1%})")
         
     def _compute_sequence_indices(self):
         """预计算序列中各部分的索引位置"""
@@ -385,13 +547,23 @@ class RDTWithFLARE(nn.Module):
         #         raise  # 直接让程序崩溃，打印完整Traceback
         # FLARE: 计算目标tokens（在transformer处理前）
         if return_alignment_loss and future_obs_image is not None:
+            import torch.nn.functional as F
+            # 把图像从 (B,3,384,384) resize 到 (B,3,256,256)
+            future_obs_image = F.interpolate(
+                future_obs_image,
+                size=(256, 256),
+                mode='bilinear',
+                align_corners=False
+)
             try:
                 vl_tokens, vl_mask = self.vl_token_generator(
                     future_obs_image, text_instructions
                 )
+                vl_mask = vl_mask.bool()
                 target_future_tokens = self.target_generator(vl_tokens, vl_mask)
             except Exception as e:
-                print(f"Warning: Target token generation failed: {e}")
+                print(f"🔴 Target token generation failed: {repr(e)}")
+                traceback.print_exc()
                 target_future_tokens = None
 
         # 通过transformer blocks
@@ -400,9 +572,10 @@ class RDTWithFLARE(nn.Module):
         # alignment_loss = None
         
         # Transformer处理
+
         for i, block in enumerate(self.blocks):
-            # 改进的条件使用策略：前期语言，后期视觉
-            condition_idx = 0 if i < len(self.blocks) // 2 else 1
+            # 交替注入语言/视觉条件
+            condition_idx = i % len(conds)     # i 为偶数时 0 → 语言；i 为奇数时 1 → 视觉
             c, mask = conds[condition_idx], masks[condition_idx]
             sequence = block(sequence, c, mask)
 
@@ -436,80 +609,26 @@ class RDTWithFLARE(nn.Module):
             return action_tokens
         
     def _process_future_obs_tokens(self, batch_size, future_obs_image, device, target_dtype):
-        """处理未来观测tokens """
-
+        """
+        处理未来观测tokens - 简化版本
         
-        if future_obs_image is not None:
-            try:
-                # Step 1: 视觉编码
-                with torch.no_grad():
-                    future_vision_features = self.vl_token_generator.vision_encoder(future_obs_image)
-                
-                # Step 2: 调整token数量
-                if future_vision_features.shape[1] != self.num_future_tokens:
-
-                    future_vision_features = F.adaptive_avg_pool1d(
-                        future_vision_features.transpose(1, 2),
-                        self.num_future_tokens
-                    ).transpose(1, 2)
-
-                
-                # Step 3: 关键的维度修复
-
-                current_dim = future_vision_features.shape[-1]  # 1152
-                target_dim = 2048  # MLP期望的输入维度
-                
-                
-                if current_dim != target_dim:
-                    # 创建维度适配器
-                    if not hasattr(self, 'vision_feature_adapter'):
-                        self.vision_feature_adapter = nn.Linear(
-                            current_dim, 
-                            target_dim,
-                            bias=False  # 可选：不使用偏置
-                        ).to(device=device, dtype=target_dtype)
-                        
-                        # 初始化适配器权重（重要！）
-                        with torch.no_grad():
-                            # 使用Xavier初始化
-                            nn.init.xavier_uniform_(self.vision_feature_adapter.weight)
-                    
-                    # 应用适配器
-                    future_vision_features = self.vision_feature_adapter(future_vision_features)
-                
-                # Step 4: 应用MLP
-                
-                future_obs_tokens = self.future_obs_mlp(future_vision_features)
-                
-                
-            except Exception as e:
-                import traceback
-                traceback.print_exc()
-                
-                # 创建fallback tokens
-                future_obs_tokens = torch.zeros(
-                    batch_size, 
-                    self.num_future_tokens, 
-                    2048,  # 使用MLP的输出维度
-                    device=device, 
-                    dtype=target_dtype
-                )
-
-        else:
-            
-            # 检查随机tokens的维度是否正确
-            random_token_dim = self.future_obs_tokens.shape[-1]
-            mlp_input_dim = 2048  
-
-            
-            if random_token_dim != mlp_input_dim:
-                # 重新创建正确维度的随机tokens
-                self.future_obs_tokens = nn.Parameter(
-                    torch.randn(1, self.num_future_tokens, mlp_input_dim) * 0.02
-                ).to(device=device, dtype=target_dtype)
-            
-            future_obs_tokens = self.future_obs_tokens.expand(batch_size, -1, -1)
-            future_obs_tokens = self.future_obs_mlp(future_obs_tokens)
+        职责：为DiT序列提供future_obs位置的tokens（可学习参数）
+        """
         
-        result = future_obs_tokens.to(device=device, dtype=target_dtype)
-        return result
+        # 🎯 忽略future_obs_image，这里不应该用它！
+        # future_obs_image应该只用于生成target tokens进行监督
+        
+        # 确保future_obs_tokens参数存在且维度正确
+        if not hasattr(self, 'future_obs_tokens') or self.future_obs_tokens.shape[-1] != self.hidden_size:
+            print(f"🔧 创建可学习future_obs_tokens: {self.num_future_tokens} x {self.hidden_size}")
+            self.future_obs_tokens = nn.Parameter(
+                torch.randn(1, self.num_future_tokens, self.hidden_size) * 0.02
+            ).to(device=device, dtype=target_dtype)
+        
+        # 扩展到batch size
+        future_obs_tokens = self.future_obs_tokens.expand(batch_size, -1, -1)
+        
+        # 通过MLP处理（增加表达能力）
+        future_obs_tokens = self.future_obs_mlp(future_obs_tokens)
+        
+        return future_obs_tokens.to(device=device, dtype=target_dtype)

@@ -68,8 +68,8 @@ model:
   enable_future_obs: true
   future_obs_prob: 1  # 使用未来观测的概率
   num_future_tokens: 32
-  activation_layer: 6
-  alignment_loss_weight: 0.1
+  activation_layer: 21
+  alignment_loss_weight: 0.2
   # For noise scheduler
   noise_scheduler:
     type: ddpm
@@ -86,3 +86,9 @@ model:
     power: 0.75
     min_value: 0.0
     max_value: 0.9999
+  # 🎯 将Q-Former改为2层  
+  qformer:
+    num_layers: 2    # 新增Q-Former配置，设为2层
+    num_heads: 8
+    dropout: 0.1
+    cross_attention_freq: 1  # 每层都使用cross-attention

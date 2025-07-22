@@ -29,16 +29,31 @@ class RDTRunnerWithFLARE(nn.Module, CompatiblePyTorchModelHubMixin):
                  dtype=torch.bfloat16,
                  # FLARE参数
                  num_future_tokens=32,
-                 activation_layer=6,
-                 alignment_loss_weight=0.1,
+                 activation_layer=21,
+                 alignment_loss_weight=0.2,
                  num_vl_fusion_layers=4,
-                 num_qformer_layers=6,
+                 num_qformer_layers=2,
                  alignment_temperature=0.07,
-                 vision_model_name="google/siglip-so400m-patch14-384",
-                 text_model_name="google/siglip-so400m-patch14-384",
+                # 🔧 区分两个编码器的参数
+                 future_vision_model_name=None,  # 未来观测编码器（SigLIP2-256）
+                 future_text_model_name=None,    # 未来观测文本编码器
+                 current_vision_image_size=384,  # 当前图像尺寸
+                 future_vision_image_size=256,   # 未来图像尺寸
                  enable_flare=True):
         super().__init__()
+        # 🔧 路径和配置处理
+        self.future_vision_path = future_vision_model_name or "/home/deng_xiang/qian_daichao/RoboTwin/policy/RDT_flare/siglip2-large-patch16-256"
+        self.future_text_path = future_text_model_name or self.future_vision_path
+        self.current_vision_image_size = current_vision_image_size
+        self.future_vision_image_size = future_vision_image_size
         
+        print(f"🔧 RDTRunnerWithFLARE 双编码器配置:")
+        print(f"   未来观测视觉模型: {self.future_vision_path}")
+        print(f"   未来观测文本模型: {self.future_text_path}")
+        print(f"   当前图像尺寸: {self.current_vision_image_size}")
+        print(f"   未来图像尺寸: {self.future_vision_image_size}")
+        print(f"   文本最大长度: {max_lang_cond_len}")
+        print(f"   FLARE enabled: {enable_flare}")
         self.alignment_loss_weight = alignment_loss_weight
         self.enable_flare = enable_flare
         self.num_future_tokens = num_future_tokens
@@ -62,8 +77,10 @@ class RDTRunnerWithFLARE(nn.Module, CompatiblePyTorchModelHubMixin):
             num_vl_fusion_layers=num_vl_fusion_layers,
             num_qformer_layers=num_qformer_layers,
             alignment_temperature=alignment_temperature,
-            vision_model_name=vision_model_name,
-            text_model_name=text_model_name,
+            # 🔧 只传递未来观测相关的路径
+            future_vision_model_name=self.future_vision_path,
+            future_text_model_name=self.future_text_path,
+            future_vision_image_size=self.future_vision_image_size,
         )
 
         # 创建条件适配器
@@ -144,7 +161,7 @@ class RDTRunnerWithFLARE(nn.Module, CompatiblePyTorchModelHubMixin):
 
         return projector
 
-    # 在 models/rdt_runner.py 中替换现有的 adapt_conditions 方法
+    
     def adapt_conditions(self, lang_tokens, img_tokens, state_action_traj, future_vision_tokens=None):
         # 获取模型期望的数据类型
         target_dtype = next(self.lang_adaptor.parameters()).dtype

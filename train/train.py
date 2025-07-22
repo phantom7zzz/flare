@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 # coding=utf-8
-# FLARE增强的训练脚本 - A800 BF16优化版
+# FLARE增强的训练脚本 - 双编码器版本 A800 BF16优化
 
 import copy
 import logging
@@ -30,7 +30,7 @@ from train.sample import log_sample_res
 
 if is_wandb_available():
     import wandb
-
+torch.autograd.set_detect_anomaly(True)
 
 def save_model_card(repo_id: str, base_model=str, repo_folder=None):
     yaml_content = f"""
@@ -50,23 +50,28 @@ tags:
 - diffusion
 - rdt
 - flare
+- dual-encoder
 - bf16
 - a800
 ---
     """
     model_card = f"""
-# RDT-FLARE - {repo_id}
+# RDT-FLARE Dual Encoder - {repo_id}
 
-This is a FLARE-enhanced RDT model derived from {base_model}. The weights were trained using [RDT](https://rdt-robotics.github.io/rdt-robotics/) with FLARE (Future-conditioned Language-guided Action REpresentation) enhancement.
+This is a FLARE-enhanced RDT model with dual vision encoders derived from {base_model}. 
+
+## Dual Encoder Architecture
+- **Current Image Encoder**: SigLIP-384 for processing current observations → DiT layers
+- **Future Observation Encoder**: SigLIP2-256 for processing future observations → FLARE components
 
 ## FLARE Features
-- Future observation alignment
-- Vision-Language token fusion
+- Future observation alignment with dual encoder architecture
+- Vision-Language token fusion (SigLIP2-256)
 - Q-Former target generation
 - DiT activation alignment
 - BF16 mixed precision training on A800
 
-The model includes future observation prediction capabilities for improved action planning.
+The model includes future observation prediction capabilities with specialized encoders for improved action planning.
 Optimized for A800 GPU with BF16 mixed precision training.
 """
     with open(os.path.join(repo_folder, "README.md"), "w") as f:
@@ -131,11 +136,19 @@ def train(args, logger):
     args.output_dir = model_config["checkpoint_path"]
     logging_dir = Path(args.output_dir, args.logging_dir)
 
-    # FLARE参数从模型配置或命令行参数中读取
+    # 🔧 FLARE参数从模型配置或命令行参数中读取
     enable_flare = getattr(args, 'enable_flare', model_config.get('enable_flare', True))
     num_future_tokens = getattr(args, 'num_future_tokens', model_config.get('num_future_tokens', 32))
-    activation_layer = getattr(args, 'activation_layer', model_config.get('activation_layer', 6))
-    alignment_loss_weight = getattr(args, 'alignment_loss_weight', model_config.get('alignment_loss_weight', 0.1))
+    activation_layer = getattr(args, 'activation_layer', model_config.get('activation_layer', 21))
+    alignment_loss_weight = getattr(args, 'alignment_loss_weight', model_config.get('alignment_loss_weight', 0.2))
+
+    # 🔧 双编码器路径配置
+    current_vision_path = args.pretrained_vision_encoder_name_or_path
+    future_vision_path = getattr(args, 'future_vision_encoder_path', './models/siglip2-large-patch16-256')
+    future_text_path = getattr(args, 'future_text_encoder_path', None) or future_vision_path
+    max_text_length = getattr(args, 'max_text_length', 32)
+    current_vision_image_size = getattr(args, 'current_vision_image_size', 384)
+    future_vision_image_size = getattr(args, 'future_vision_image_size', 256)
 
     accelerator_project_config = ProjectConfiguration(total_limit=args.checkpoints_total_limit)
     accelerator = Accelerator(
@@ -147,6 +160,7 @@ def train(args, logger):
         project_config=accelerator_project_config,
     )
     is_a800, gpu_memory = check_gpu_capabilities(logger)
+    
     if args.report_to == "wandb":
         if not is_wandb_available():
             raise ImportError("Make sure to install wandb if you want to use it for logging during training.")
@@ -196,7 +210,7 @@ def train(args, logger):
     if is_a800 and accelerator.mixed_precision != "bf16":
         logger.warning("💡 建议在A800上使用BF16混合精度以获得最佳性能")
     
-    # 初始化编码器
+    # 🔧 初始化文本编码器
     if args.precomp_lang_embed:
         tokenizer, text_encoder = None, None
     else:
@@ -204,29 +218,65 @@ def train(args, logger):
             from_pretrained=args.pretrained_text_encoder_name_or_path,
             model_max_length=config["dataset"]["tokenizer_max_length"],
             device=accelerator.device,
-            torch_dtype=weight_dtype,  # 🎯 指定数据类型
+            torch_dtype=weight_dtype,
         )
         tokenizer, text_encoder = text_embedder.tokenizer, text_embedder.model
 
-    # 🎯 创建视觉编码器时指定本地文件
-    vision_encoder = SiglipVisionTower(
-        vision_tower=args.pretrained_vision_encoder_name_or_path, 
+    # 🔧 配置并显示双视觉编码器系统
+    logger.info("=" * 80)
+    logger.info("🔧 配置双视觉编码器系统:")
+    logger.info("=" * 80)
+    logger.info(f"📷 当前图像编码器(SigLIP-384):")
+    logger.info(f"   路径: {current_vision_path}")
+    logger.info(f"   图像尺寸: {current_vision_image_size}x{current_vision_image_size}")
+    logger.info(f"   功能: 处理当前观测图像 → DiT layers → 动作预测")
+    logger.info("")
+    logger.info(f"🔮 未来观测编码器(SigLIP2-256):")
+    logger.info(f"   视觉路径: {future_vision_path}")
+    logger.info(f"   文本路径: {future_text_path}")
+    logger.info(f"   图像尺寸: {future_vision_image_size}x{future_vision_image_size}")
+    logger.info(f"   文本长度: {max_text_length} tokens")
+    logger.info(f"   功能: 处理未来观测图像+指令 → FLARE → 目标生成")
+    logger.info("=" * 80)
+    
+    # 🔧 创建当前图像的视觉编码器（SigLIP-384）- 用于DiT处理
+    logger.info("📷 初始化当前图像编码器（SigLIP-384）...")
+    current_vision_encoder = SiglipVisionTower(
+        vision_tower=current_vision_path,
         args=None
     )
-    image_processor = vision_encoder.image_processor
+    image_processor = current_vision_encoder.image_processor
+    
+    logger.info(f"✅ 当前图像编码器加载完成:")
+    logger.info(f"   模型: {current_vision_encoder.vision_tower_name}")
+    logger.info(f"   Hidden size: {current_vision_encoder.hidden_size}")
+    logger.info(f"   Num patches: {current_vision_encoder.num_patches}")
+    logger.info(f"   Image size: {current_vision_encoder.config.image_size}")
+    
+    # 🔧 验证未来观测编码器路径（FLARE内部会创建SigLIP2编码器）
+    logger.info("🔮 验证未来观测编码器路径...")
+    if os.path.exists(future_vision_path):
+        logger.info(f"✅ 未来观测编码器路径有效: {future_vision_path}")
+    else:
+        logger.warning(f"⚠️  未来观测编码器路径不存在: {future_vision_path}")
+        logger.warning("   FLARE组件可能无法正常工作")
 
-    # 🎯 构建FLARE增强的RDT模型 - 修复模型创建逻辑
+    # 🎯 构建FLARE增强的RDT模型
     pretrained_path = args.pretrained_model_name_or_path
+    
+    # 计算当前图像的条件长度（基于当前编码器）
+    img_cond_len = (config["common"]["img_history_size"] * config["common"]["num_cameras"] *
+                    current_vision_encoder.num_patches)
+    
+    logger.info(f"🔧 构建FLARE增强的RDT模型...")
+    logger.info(f"   图像条件长度: {img_cond_len} (基于当前编码器patch数: {current_vision_encoder.num_patches})")
     
     if (pretrained_path is not None and 
         (os.path.isfile(pretrained_path) or os.path.isdir(pretrained_path))):
         
         logger.info(f"从预训练路径构建FLARE模型: {pretrained_path}")
         
-        # 首先创建FLARE模型架构
-        img_cond_len = (config["common"]["img_history_size"] * config["common"]["num_cameras"] *
-                        vision_encoder.num_patches)
-        
+        # 🔧 创建带双编码器配置的FLARE模型
         rdt = RDTRunnerWithFLARE(
             action_dim=config["common"]["state_dim"],
             pred_horizon=config["common"]["action_chunk_size"],
@@ -234,17 +284,17 @@ def train(args, logger):
             lang_token_dim=config["model"]["lang_token_dim"],
             img_token_dim=config["model"]["img_token_dim"],
             state_token_dim=config["model"]["state_token_dim"],
-            max_lang_cond_len=config["dataset"]["tokenizer_max_length"],
+            max_lang_cond_len=max_text_length,  # 🔧 使用新的文本长度
             img_cond_len=img_cond_len,
             img_pos_embed_config=[
                 ("image", (
                     config["common"]["img_history_size"],
                     config["common"]["num_cameras"],
-                    -vision_encoder.num_patches,
+                    -current_vision_encoder.num_patches,  # 🔧 基于当前编码器
                 )),
             ],
             lang_pos_embed_config=[
-                ("lang", -config["dataset"]["tokenizer_max_length"]),
+                ("lang", -max_text_length),  # 🔧 使用新的文本长度
             ],
             dtype=weight_dtype,
             # FLARE特定参数
@@ -252,6 +302,11 @@ def train(args, logger):
             activation_layer=activation_layer,
             alignment_loss_weight=alignment_loss_weight,
             enable_flare=enable_flare,
+            # 🔧 关键：双编码器路径配置
+            future_vision_model_name=future_vision_path,
+            future_text_model_name=future_text_path,
+            current_vision_image_size=current_vision_image_size,
+            future_vision_image_size=future_vision_image_size,
         )
         
         # 🎯 尝试加载预训练权重（如果是文件）
@@ -268,7 +323,10 @@ def train(args, logger):
             
     else:
         logger.info("从配置文件构建FLARE模型（随机初始化）")
-        rdt = create_flare_model_from_standard_rdt(args, config, vision_encoder, weight_dtype)
+        rdt = create_flare_model_from_standard_rdt(
+            args, config, current_vision_encoder, weight_dtype,
+            future_vision_path, future_text_path, max_text_length
+        )
 
     # 🎯 确保模型数据类型正确
     rdt = rdt.to(dtype=weight_dtype)
@@ -282,7 +340,6 @@ def train(args, logger):
     
     if dtype_issues:
         logger.warning(f"⚠️  发现数据类型不一致: {len(dtype_issues)} 个参数")
-        # 强制转换
         rdt = rdt.to(weight_dtype)
         logger.info("✅ 已强制转换所有参数到统一数据类型")
     else:
@@ -347,12 +404,12 @@ def train(args, logger):
         eps=args.adam_epsilon,
     )
 
-    # 创建FLARE增强的数据集
+    # 🔧 创建FLARE增强的数据集（使用当前编码器的image_processor）
     train_dataset = VLAConsumerDatasetWithFLARE(
         model_config_path=args.model_config_path,
         config=config["dataset"],
         tokenizer=tokenizer,
-        image_processor=image_processor,
+        image_processor=image_processor,  # 🔧 使用当前编码器的processor
         num_cameras=config["common"]["num_cameras"],
         img_history_size=config["common"]["img_history_size"],
         dataset_type=args.dataset_type,
@@ -372,7 +429,7 @@ def train(args, logger):
         model_config_path=args.model_config_path,
         config=config["dataset"],
         tokenizer=tokenizer,
-        image_processor=image_processor,
+        image_processor=image_processor,  # 🔧 使用当前编码器的processor
         num_cameras=config["common"]["num_cameras"],
         img_history_size=config["common"]["img_history_size"],
         dataset_type=args.dataset_type,
@@ -442,8 +499,10 @@ def train(args, logger):
     if text_encoder is not None:
         text_encoder.to(accelerator.device, dtype=weight_dtype)
 
-    if vision_encoder is not None:
-        vision_encoder.vision_tower.to(accelerator.device, dtype=weight_dtype)
+    # 🔧 只移动当前图像编码器到设备（未来编码器在FLARE内部管理）
+    if current_vision_encoder is not None:
+        current_vision_encoder.vision_tower.to(accelerator.device, dtype=weight_dtype)
+        logger.info("✅ 当前图像编码器已移动到设备")
 
     # Recalculate training steps
     num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
@@ -462,21 +521,28 @@ def train(args, logger):
             "weight_dtype": str(weight_dtype),
             "is_a800": is_a800,
             "gpu_memory_gb": gpu_memory,
+            # 🔧 双编码器配置
+            "dual_encoder": True,
+            "current_vision_path": current_vision_path,
+            "future_vision_path": future_vision_path,
+            "current_image_size": current_vision_image_size,
+            "future_image_size": future_vision_image_size,
+            "max_text_length": max_text_length,
         })
         
         accelerator.init_trackers(
-            "VLA_FLARE",
+            "VLA_FLARE_DualEncoder",
             config=tracker_config,
             init_kwargs={"wandb": {
-                "name": f"RDT_FLARE_{args.CONFIG_NAME}_{accelerator.mixed_precision}",
-                "tags": ["rdt", "flare", "multimodal", "robotics", "a800", accelerator.mixed_precision],
+                "name": f"RDT_FLARE_Dual_{args.CONFIG_NAME}_{accelerator.mixed_precision}",
+                "tags": ["rdt", "flare", "dual-encoder", "multimodal", "robotics", "a800", accelerator.mixed_precision],
             }},
         )
 
     # Training info
     total_batch_size = (args.train_batch_size * accelerator.num_processes * args.gradient_accumulation_steps)
 
-    logger.info("***** Running FLARE training *****")
+    logger.info("***** Running FLARE Dual Encoder training *****")
     logger.info(f"  Num examples = {len(train_dataset)}")
     logger.info(f"  Num batches each epoch = {len(train_dataloader)}")
     logger.info(f"  Num Epochs = {args.num_train_epochs}")
@@ -490,12 +556,11 @@ def train(args, logger):
     logger.info(f"  Future tokens = {num_future_tokens}")
     logger.info(f"  Activation layer = {activation_layer}")
     logger.info(f"  Alignment loss weight = {alignment_loss_weight}")
+    logger.info(f"  Current encoder: SigLIP-{current_vision_image_size}")
+    logger.info(f"  Future encoder: SigLIP2-{future_vision_image_size}")
     
     global_step = 0
     first_epoch = 0
-
-    # Load from pretrained checkpoint - 移到模型创建后
-    # (权重加载已经在模型创建时处理)
 
     # Resume from checkpoint
     if args.resume_from_checkpoint:
@@ -540,12 +605,78 @@ def train(args, logger):
         range(global_step, args.max_train_steps),
         disable=not accelerator.is_local_main_process,
     )
-    progress_bar.set_description(f"FLARE Training ({accelerator.mixed_precision})")
+    progress_bar.set_description(f"FLARE Dual Encoder Training ({accelerator.mixed_precision})")
 
     # Training metrics
     loss_for_log = {}
     alignment_metrics_log = {}
     
+    # for epoch in range(first_epoch, args.num_train_epochs):
+    #     rdt.train()
+
+    #     # Set progress bar to correct position
+    #     if args.resume_from_checkpoint and epoch == first_epoch:
+    #         progress_bar.update(resume_step // args.gradient_accumulation_steps)
+
+    #     # 🎯 FLARE双编码器训练循环 - 支持BF16混合精度
+    #     for batch in train_dataloader:
+    #         with accelerator.accumulate(rdt):
+    #             # 🎯 使用autocast包装前向传播（混合精度）
+    #             with torch.autocast(device_type="cuda", dtype=weight_dtype, enabled=(accelerator.mixed_precision != "no")):
+    #                 # 基础数据准备
+    #                 images = batch["images"]
+    #                 states = batch["states"]
+    #                 states = states[:, -1:, :]  # 只使用最后一个状态
+    #                 actions = batch["actions"]
+    #                 state_elem_mask = batch["state_elem_mask"]
+    #                 ctrl_freqs = batch["ctrl_freqs"]
+
+    #                 # FLARE特定数据
+    #                 future_obs_images = batch.get("future_obs_images")
+    #                 text_instructions = batch.get("text_instructions", [""] * len(images))
+    #                 has_future_obs = batch.get("has_future_obs")
+
+    #                 with torch.no_grad():
+    #                     # 🔧 使用当前图像编码器处理当前观测（用于DiT）
+    #                     images_tensor = torch.stack(images, dim=0)  # [B, num_imgs, C, H, W]
+    #                     batch_size, _, C, H, W = images_tensor.shape
+    #                     images = images_tensor  # 更新images变量
+                        
+    #                     # 🔧 当前图像编码：SigLIP-384 → DiT layers
+    #                     image_embeds = current_vision_encoder(images.reshape(-1, C, H, W)).detach()
+    #                     image_embeds = image_embeds.reshape((batch_size, -1, current_vision_encoder.hidden_size))
+
+    #                     # 编码语言（用于DiT）
+    #                     lang_attn_mask = batch["lang_attn_mask"]
+    #                     if args.precomp_lang_embed:
+    #                         text_embeds = batch["lang_embeds"]
+    #                     else:
+    #                         text_embeds = text_encoder(
+    #                             input_ids=batch["input_ids"], 
+    #                             attention_mask=lang_attn_mask
+    #                         )["last_hidden_state"].detach()
+
+    #                     # 🔧 注意：未来观测编码由FLARE内部的SigLIP2-256处理
+    #                     # 这里不需要预先编码未来观测，直接传递原始图像给FLARE
+    #                     future_vision_embeds = None  # FLARE内部处理
+
+    #                 state_elem_mask = state_elem_mask.unsqueeze(1)
+                    
+    #                 # 🔧 计算FLARE增强的损失（双编码器版本）
+    #                 unwrapped_rdt = accelerator.unwrap_model(rdt)
+    #                 total_loss, loss_dict = unwrapped_rdt.compute_loss_with_flare(
+    #                     lang_tokens=text_embeds,
+    #                     lang_attn_mask=lang_attn_mask,
+    #                     img_tokens=image_embeds,  # 当前图像的编码（SigLIP-384）
+    #                     state_tokens=states,
+    #                     action_gt=actions,
+    #                     action_mask=state_elem_mask,
+    #                     ctrl_freqs=ctrl_freqs,
+    #                     future_vision_tokens=future_vision_embeds,  # None，FLARE内部处理
+    #                     text_instructions=text_instructions,
+    #                     has_future_obs=has_future_obs,
+    #                     future_obs_images=future_obs_images  # 🔧 传递原始图像给FLARE（SigLIP2-256处理）
+    #                 )
     for epoch in range(first_epoch, args.num_train_epochs):
         rdt.train()
 
@@ -553,7 +684,7 @@ def train(args, logger):
         if args.resume_from_checkpoint and epoch == first_epoch:
             progress_bar.update(resume_step // args.gradient_accumulation_steps)
 
-        # 🎯 FLARE训练循环 - 支持BF16混合精度
+        # 🎯 FLARE统一T5架构训练循环 - 支持BF16混合精度
         for batch in train_dataloader:
             with accelerator.accumulate(rdt):
                 # 🎯 使用autocast包装前向传播（混合精度）
@@ -566,51 +697,73 @@ def train(args, logger):
                     state_elem_mask = batch["state_elem_mask"]
                     ctrl_freqs = batch["ctrl_freqs"]
 
-                    # FLARE特定数据
+                    # 🎯 FLARE特定数据 - 统一T5架构修复
                     future_obs_images = batch.get("future_obs_images")
-                    text_instructions = batch.get("text_instructions", [""] * len(images))
                     has_future_obs = batch.get("has_future_obs")
+                    
+                    # 🔧 关键修复：根据是否使用预计算嵌入选择文本数据源
+                    if args.precomp_lang_embed:
+                        # 使用T5嵌入路径给FLARE（统一T5架构）
+                        text_instructions = batch.get("flare_text_embed_paths", [])
+                        
+                        # 调试信息
+                        if global_step % 100 == 0:  # 每100步打印一次
+                            print(f"🎯 统一T5架构 - Step {global_step}:")
+                            print(f"   FLARE使用T5嵌入路径: {len(text_instructions)} 个文件")
+                            if text_instructions:
+                                print(f"   示例路径: {text_instructions[0]}")
+                            else:
+                                print("   ⚠️ 未获取到T5嵌入路径")
+                    else:
+                        # 使用原始文本字符串
+                        text_instructions = batch.get("text_instructions", [""] * len(images))
+                        if global_step % 100 == 0:
+                            print(f"🎯 使用原始文本: {text_instructions[0] if text_instructions else 'None'}")
 
                     with torch.no_grad():
-                        # 编码图像
+                        # 🔧 使用当前图像编码器处理当前观测（用于DiT）
                         images_tensor = torch.stack(images, dim=0)  # [B, num_imgs, C, H, W]
                         batch_size, _, C, H, W = images_tensor.shape
                         images = images_tensor  # 更新images变量
-                        image_embeds = vision_encoder(images.reshape(-1, C, H, W)).detach()
-                        image_embeds = image_embeds.reshape((batch_size, -1, vision_encoder.hidden_size))
+                        
+                        # 🔧 当前图像编码：SigLIP-384 → DiT layers
+                        image_embeds = current_vision_encoder(images.reshape(-1, C, H, W)).detach()
+                        image_embeds = image_embeds.reshape((batch_size, -1, current_vision_encoder.hidden_size))
 
-                        # 编码语言
+                        # 🎯 编码语言（用于DiT）- T5嵌入
                         lang_attn_mask = batch["lang_attn_mask"]
                         if args.precomp_lang_embed:
-                            text_embeds = batch["lang_embeds"]
+                            text_embeds = batch["lang_embeds"]  # T5预计算嵌入
                         else:
                             text_embeds = text_encoder(
                                 input_ids=batch["input_ids"], 
                                 attention_mask=lang_attn_mask
                             )["last_hidden_state"].detach()
 
-                        # 编码未来观测图像（如果存在）
-                        future_vision_embeds = None
-                        if future_obs_images is not None and enable_flare:
-                            future_vision_embeds = vision_encoder(future_obs_images).detach()
+                        # 🔧 注意：未来观测编码由FLARE内部的统一T5架构处理
+                        # VLTokenGenerator会使用相同的T5嵌入路径，确保架构统一
+                        future_vision_embeds = None  # FLARE内部处理
 
                     state_elem_mask = state_elem_mask.unsqueeze(1)
                     
-                    # 计算FLARE增强的损失
+                    # 🎯 计算FLARE增强的损失（统一T5架构版本）
                     unwrapped_rdt = accelerator.unwrap_model(rdt)
+                    
+                    
                     total_loss, loss_dict = unwrapped_rdt.compute_loss_with_flare(
-                        lang_tokens=text_embeds,
+                        lang_tokens=text_embeds,                # T5嵌入 → DiT处理当前状态
                         lang_attn_mask=lang_attn_mask,
-                        img_tokens=image_embeds,
+                        img_tokens=image_embeds,                # 当前图像（SigLIP-384）→ DiT
                         state_tokens=states,
                         action_gt=actions,
                         action_mask=state_elem_mask,
                         ctrl_freqs=ctrl_freqs,
-                        future_vision_tokens=future_vision_embeds,
-                        text_instructions=text_instructions,
+                        future_vision_tokens=future_vision_embeds,  # None，FLARE内部处理
+                        text_instructions=text_instructions,    # 🎯 T5路径 → FLARE统一处理
                         has_future_obs=has_future_obs,
-                        future_obs_images=batch.get("future_obs_images")
+                        future_obs_images=future_obs_images,    # 未来图像 → FLARE（内部统一T5处理）
                     )
+                
 
                 # 反向传播（accelerator会自动处理混合精度）
                 accelerator.backward(total_loss)
@@ -641,7 +794,7 @@ def train(args, logger):
                 if args.sample_period > 0 and global_step % args.sample_period == 0:
                     sample_loss_for_log = log_sample_res(
                         text_encoder,
-                        vision_encoder,
+                        current_vision_encoder,  # 🔧 使用当前编码器进行采样
                         rdt,
                         args,
                         accelerator,
@@ -681,6 +834,13 @@ def train(args, logger):
                     except Exception as e:
                         logger.debug(f"Failed to get performance metrics: {e}")
 
+                # 🔧 双编码器特定的监控
+                if global_step % 200 == 0:
+                    logger.info(f"🔧 双编码器状态监控 Step {global_step}:")
+                    logger.info(f"   当前编码器: 处理了 {batch_size} 个当前观测")
+                    logger.info(f"   未来编码器: 处理了 {has_future_obs.sum().item() if has_future_obs is not None else 0} 个未来观测")
+                    logger.info(f"   FLARE使用率: {loss_dict.get('used_flare', False)}")
+
             # 记录损失
             logs = {
                 "loss": total_loss.detach().item(), 
@@ -689,6 +849,10 @@ def train(args, logger):
                 "alignment_loss": loss_dict.get('alignment_loss', 0.0),
                 "used_flare": float(loss_dict.get('used_flare', False)),
                 "epoch": epoch,
+                # 🔧 双编码器特定指标
+                "current_encoder_active": True,
+                "future_encoder_active": bool(enable_flare and future_obs_images is not None),
+                "future_obs_ratio": batch.get("future_obs_ratio", 0.0),
             }
             
             # 🎯 BF16特定指标
@@ -721,7 +885,7 @@ def train(args, logger):
         ema_save_path = os.path.join(args.output_dir, f"ema")
         accelerator.save_model(ema_rdt, ema_save_path)
 
-        logger.info(f"✅ FLARE模型已保存到: {args.output_dir}")
+        logger.info(f"✅ FLARE双编码器模型已保存到: {args.output_dir}")
         
         # 🎯 保存训练配置和性能信息
         training_info = {
@@ -734,6 +898,13 @@ def train(args, logger):
             "enable_flare": enable_flare,
             "num_future_tokens": num_future_tokens,
             "alignment_loss_weight": alignment_loss_weight,
+            # 🔧 双编码器信息
+            "dual_encoder": True,
+            "current_vision_encoder": current_vision_path,
+            "future_vision_encoder": future_vision_path,
+            "current_image_size": current_vision_image_size,
+            "future_image_size": future_vision_image_size,
+            "max_text_length": max_text_length,
         }
         
         import json
@@ -749,7 +920,7 @@ def train(args, logger):
             upload_folder(
                 repo_id=repo_id,
                 folder_path=args.output_dir,
-                commit_message="End of FLARE training with BF16 mixed precision",
+                commit_message="End of FLARE dual encoder training with BF16 mixed precision",
                 token=args.hub_token,
                 allow_patterns=["pytorch_model.bin", "*.json", "*.md"],
             )
@@ -757,22 +928,23 @@ def train(args, logger):
     accelerator.end_training()
 
 
-def create_flare_model_from_standard_rdt(args, config, vision_encoder, weight_dtype):
+def create_flare_model_from_standard_rdt(args, config, current_vision_encoder, weight_dtype,
+                                        future_vision_path, future_text_path, max_text_length):
     """
-    创建FLARE模型（支持从预训练RDT初始化或完全随机初始化）
+    创建FLARE模型（支持双编码器配置）
     """
     from models.rdt_runner import RDTRunnerWithFLARE
     import logging
     
     logger = logging.getLogger(__name__)
     
-    # 计算图像条件长度
+    # 🔧 计算图像条件长度（基于当前编码器）
     img_cond_len = (config["common"]["img_history_size"] * config["common"]["num_cameras"] *
-                    vision_encoder.num_patches)
+                    current_vision_encoder.num_patches)
     
-    logger.info("创建FLARE增强的RDT模型...")
+    logger.info("创建FLARE增强的双编码器RDT模型...")
     
-    # 创建FLARE模型
+    # 🔧 创建带双编码器配置的FLARE模型
     flare_rdt = RDTRunnerWithFLARE(
         action_dim=config["common"]["state_dim"],
         pred_horizon=config["common"]["action_chunk_size"],
@@ -780,33 +952,40 @@ def create_flare_model_from_standard_rdt(args, config, vision_encoder, weight_dt
         lang_token_dim=config["model"]["lang_token_dim"],
         img_token_dim=config["model"]["img_token_dim"],
         state_token_dim=config["model"]["state_token_dim"],
-        max_lang_cond_len=config["dataset"]["tokenizer_max_length"],
+        max_lang_cond_len=max_text_length,  # 🔧 使用新的文本长度
         img_cond_len=img_cond_len,
         img_pos_embed_config=[
             ("image", (
                 config["common"]["img_history_size"],
                 config["common"]["num_cameras"],
-                -vision_encoder.num_patches,
+                -current_vision_encoder.num_patches,  # 🔧 基于当前编码器
             )),
         ],
         lang_pos_embed_config=[
-            ("lang", -config["dataset"]["tokenizer_max_length"]),
+            ("lang", -max_text_length),  # 🔧 使用新的文本长度
         ],
         dtype=weight_dtype,
         # FLARE参数
         num_future_tokens=getattr(args, 'num_future_tokens', 32),
-        activation_layer=getattr(args, 'activation_layer', 6),
-        alignment_loss_weight=getattr(args, 'alignment_loss_weight', 0.1),
+        activation_layer=getattr(args, 'activation_layer', 21),
+        alignment_loss_weight=getattr(args, 'alignment_loss_weight', 0.2),
         enable_flare=getattr(args, 'enable_flare', True),
+        # 🔧 双编码器路径
+        future_vision_model_name=future_vision_path,
+        future_text_model_name=future_text_path,
+        current_vision_image_size=getattr(args, 'current_vision_image_size', 384),
+        future_vision_image_size=getattr(args, 'future_vision_image_size', 256),
     )
     
     # 确保模型参数的数据类型正确
     flare_rdt = flare_rdt.to(dtype=weight_dtype)
     
-    logger.info(f"✅ FLARE模型创建成功")
+    logger.info(f"✅ FLARE双编码器模型创建成功")
     logger.info(f"   参数总数: {sum(p.numel() for p in flare_rdt.parameters()):,}")
     logger.info(f"   模型数据类型: {weight_dtype}")
-    logger.info(f"   FLARE组件: 新增 VL Token生成器、Q-Former、激活对齐器")
+    logger.info(f"   当前编码器: SigLIP-384 (DiT处理)")
+    logger.info(f"   未来编码器: SigLIP2-256 (FLARE处理)")
+    logger.info(f"   FLARE组件: VL Token生成器、Q-Former、激活对齐器")
     
     return flare_rdt
 
@@ -833,5 +1012,3 @@ def monitor_training_health(loss_dict, global_step, logger):
         logger.info(f"   使用FLARE: {loss_dict.get('used_flare', False)}")
     
     return True
-
-

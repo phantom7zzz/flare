@@ -88,6 +88,10 @@ accelerate launch --main_process_port=28499 main.py \
     --pretrained_model_name_or_path=$PRETRAINED_MODEL_NAME \
     --pretrained_text_encoder_name_or_path=$TEXT_ENCODER_NAME \
     --pretrained_vision_encoder_name_or_path=$VISION_ENCODER_NAME \
+    --future_vision_encoder_path /home/deng_xiang/qian_daichao/RoboTwin/policy/RDT_flare/siglip2-large-patch16-256 \
+    --current_vision_image_size 384 \
+    --future_vision_image_size 256 \
+    --max_text_length 32 \
     --output_dir=$OUTPUT_DIR \
     --train_batch_size=$TRAIN_BATCH_SIZE \
     --sample_batch_size=$SAMPLE_BATCH_SIZE \

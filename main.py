@@ -37,7 +37,7 @@ def parse_args(input_args=None):
         "--pretrained_vision_encoder_name_or_path",
         type=str,
         default=None,
-        help="Pretrained vision encoder name or path if not the same as model_name",
+        help="Pretrained vision encoder (SigLIP-384) for current image processing in DiT layers",
     )
 
     parser.add_argument(
@@ -343,14 +343,14 @@ def parse_args(input_args=None):
     parser.add_argument(
         "--activation_layer",
         type=int,
-        default=6,
+        default=21,
         help="DiT layer index for extracting activations for alignment",
     )
     
     parser.add_argument(
         "--alignment_loss_weight",
         type=float,
-        default=0.1,
+        default=0.2,
         help="Weight for the alignment loss in FLARE training",
     )
     
@@ -364,7 +364,7 @@ def parse_args(input_args=None):
     parser.add_argument(
         "--num_qformer_layers",
         type=int,
-        default=6,
+        default=2,
         help="Number of Q-Former layers for target generation in FLARE",
     )
     
@@ -374,6 +374,42 @@ def parse_args(input_args=None):
         default=0.07,
         help="Temperature parameter for contrastive alignment loss",
     )
+    # 🔧 新增：专门用于未来观测的SigLIP2-256参数
+    parser.add_argument(
+        "--future_vision_encoder_path",
+        type=str,
+        default="/home/deng_xiang/qian_daichao/RoboTwin/policy/RDT_flare/siglip2-large-patch16-256",
+        help="Path to SigLIP2-256 model for processing future observation images in FLARE",
+    )
+    
+    parser.add_argument(
+        "--future_text_encoder_path",
+        type=str,
+        default="/home/deng_xiang/qian_daichao/RoboTwin/policy/RDT_flare/siglip2-large-patch16-256",
+        help="Path to text encoder for FLARE. If not specified, uses future_vision_encoder_path",
+    )
+    
+    parser.add_argument(
+        "--current_vision_image_size",
+        type=int,
+        default=384,
+        help="Image size for current vision encoder (SigLIP-384)",
+    )
+    
+    parser.add_argument(
+        "--future_vision_image_size", 
+        type=int,
+        default=256,
+        help="Image size for future vision encoder (SigLIP2-256)",
+    )
+    
+    parser.add_argument(
+        "--max_text_length",
+        type=int,
+        default=32,
+        help="Maximum text length for FLARE text processing",
+    )
+
 
     if input_args is not None:
         args = parser.parse_args(input_args)
