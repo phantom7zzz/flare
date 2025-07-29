@@ -118,6 +118,7 @@ accelerate launch --main_process_port=28499 main.py \
     --alignment_loss_weight=$ALIGNMENT_LOSS_WEIGHT \
     --num_vl_fusion_layers=$NUM_VL_FUSION_LAYERS \
     --num_qformer_layers=$NUM_QFORMER_LAYERS \
-    --alignment_temperature=$ALIGNMENT_TEMPERATURE
+    --alignment_temperature=$ALIGNMENT_TEMPERATURE \
+
 
 echo "🎉 FLARE训练完成!"

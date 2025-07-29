@@ -310,12 +310,42 @@ def train(args, logger):
         )
         
         # 🎯 尝试加载预训练权重（如果是文件）
+        # if os.path.isfile(pretrained_path):
+        #     try:
+        #         logger.info(f"加载预训练权重: {pretrained_path}")
+        #         checkpoint = torch.load(pretrained_path, map_location='cpu')
+        #         rdt.load_state_dict(checkpoint["module"], strict=False)
+        #         logger.info("✅ 预训练权重加载成功（部分参数，FLARE组件随机初始化）")
+        #     except Exception as e:
+        #         logger.warning(f"⚠️  预训练权重加载失败，使用随机初始化: {e}")
+        # else:
+        #     logger.info("使用目录路径，跳过权重加载")
         if os.path.isfile(pretrained_path):
             try:
                 logger.info(f"加载预训练权重: {pretrained_path}")
-                checkpoint = torch.load(pretrained_path, map_location='cpu')
-                rdt.load_state_dict(checkpoint["module"], strict=False)
-                logger.info("✅ 预训练权重加载成功（部分参数，FLARE组件随机初始化）")
+                ckpt = torch.load(pretrained_path, map_location="cpu")
+                # 支持多种 checkpoint 格式
+                if isinstance(ckpt, dict) and "module" in ckpt:
+                    state_dict = ckpt["module"]
+                elif isinstance(ckpt, dict) and "state_dict" in ckpt:
+                    state_dict = ckpt["state_dict"]
+                else:
+                    state_dict = ckpt
+
+                # 过滤掉形状不匹配的参数
+                model_sd = rdt.state_dict()
+                filtered_sd = {}
+                for k, v in state_dict.items():
+                    if k in model_sd and v.shape == model_sd[k].shape:
+                        filtered_sd[k] = v
+                    else:
+                        logger.warning(
+                            f"跳过 {k}: checkpoint {tuple(v.shape)} vs model {tuple(model_sd.get(k, v).shape)}"
+                        )
+
+                # 增量加载匹配的参数，其余保持随机初始化
+                rdt.load_state_dict(filtered_sd, strict=False)
+                logger.info("✅ 预训练权重加载成功（已加载所有 shape 匹配的参数，其余随机初始化）")
             except Exception as e:
                 logger.warning(f"⚠️  预训练权重加载失败，使用随机初始化: {e}")
         else:

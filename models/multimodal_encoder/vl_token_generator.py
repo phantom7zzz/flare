@@ -98,7 +98,7 @@ class VLTokenGenerator(nn.Module):
         self.t5_embed_dim = t5_embed_dim
         self.image_size = image_size
         self.device = device
-        
+        self.max_text_length = 32
         print("🎯 初始化统一T5架构的VLTokenGenerator")
         print(f"   隐藏层大小: {hidden_size}")
         print(f"   T5嵌入维度: {t5_embed_dim}")
@@ -321,7 +321,6 @@ class VLTokenGenerator(nn.Module):
         # 5. 🔄 通过多层融合块
         for i, fusion_layer in enumerate(self.fusion_layers):
             vl_features = fusion_layer(vl_features, mask=~vl_mask)
-            if i == 0:
         
         # 6. 输出归一化
         vl_tokens = self.output_norm(vl_features)
@@ -363,7 +362,6 @@ class VLTokenGenerator(nn.Module):
             # 🔧 情况2：文件路径列表（加载T5嵌入）
             elif isinstance(text_instructions, list) and len(text_instructions) > 0:
                 if isinstance(text_instructions[0], str) and text_instructions[0].endswith('.pt'):
-                    print(f"🔧 加载T5预计算嵌入文件...")
                     
                     t5_embeds_list = []
                     for embed_path in text_instructions:
@@ -421,7 +419,6 @@ class VLTokenGenerator(nn.Module):
                         text_features = self.t5_text_adapter(t5_embeds)
                         text_mask = torch.ones(batch_size, max_len, dtype=torch.bool, device=device)
                         
-                        print(f"✅ 加载T5嵌入成功: {t5_embeds.shape} → {text_features.shape}")
                     else:
                         # 加载失败，使用零嵌入
                         text_features = torch.zeros(batch_size, self.max_text_length, self.hidden_size, device=device)

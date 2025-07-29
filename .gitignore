@@ -5,3 +5,4 @@ model_config/*.yml
 wandb/*
 !models/
 !data/
+siglip2-large-patch16-256/

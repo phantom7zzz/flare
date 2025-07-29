@@ -22,7 +22,7 @@ class RDTRunnerWithFLARE(nn.Module, CompatiblePyTorchModelHubMixin):
                  lang_token_dim,
                  img_token_dim,
                  state_token_dim,
-                 max_lang_cond_len,
+                 max_lang_cond_len=32,
                  img_cond_len,
                  lang_pos_embed_config=None,
                  img_pos_embed_config=None,
@@ -46,7 +46,7 @@ class RDTRunnerWithFLARE(nn.Module, CompatiblePyTorchModelHubMixin):
         self.future_text_path = future_text_model_name or self.future_vision_path
         self.current_vision_image_size = current_vision_image_size
         self.future_vision_image_size = future_vision_image_size
-        
+        self.max_lang_cond_len = 32
         print(f"🔧 RDTRunnerWithFLARE 双编码器配置:")
         print(f"   未来观测视觉模型: {self.future_vision_path}")
         print(f"   未来观测文本模型: {self.future_text_path}")

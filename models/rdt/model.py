@@ -161,7 +161,7 @@ class RDTWithFLARE(nn.Module):
                  hidden_size=1152,
                  depth=28,                    # 🎯 默认28层DiT
                  num_heads=16,
-                 max_lang_cond_len=1024,
+                 max_lang_cond_len=32,
                  img_cond_len=4096,
                  lang_pos_embed_config=None,
                  img_pos_embed_config=None,

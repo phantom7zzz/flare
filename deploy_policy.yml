@@ -9,3 +9,6 @@ policy_conda_env: null
 
 checkpoint_id: null
 rdt_step: 30
+
+max_text_length: 32
+max_lang_cond_len: 32

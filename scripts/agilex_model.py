@@ -65,12 +65,14 @@ class RoboticDiffusionTransformerModel(object):
         control_frequency=25,
         pretrained=None,
         pretrained_vision_encoder_name_or_path=None,
+        max_text_length=None,
     ):
         self.args = args
         self.dtype = dtype
         self.image_size = image_size
         self.device = device
         self.control_frequency = control_frequency
+        self.max_text_length = max_text_length
         # We do not use the text encoder due to limited GPU memory
         # self.text_tokenizer, self.text_model = self.get_text_encoder(pretrained_text_encoder_name_or_path)
         self.image_processor, self.vision_model = self.get_vision_encoder(pretrained_vision_encoder_name_or_path)
@@ -88,7 +90,11 @@ class RoboticDiffusionTransformerModel(object):
         if pretrained is None or os.path.isfile(pretrained):
             img_cond_len = (self.args["common"]["img_history_size"] * self.args["common"]["num_cameras"] *
                             self.vision_model.num_patches)
-
+            # 🔧 使用外部传入的参数，如果没有则使用配置文件的值
+            max_lang_cond_len = 32                      ####手动设置文本编码最大长度
+            tokenizer_max_length = 32                   ####
+            
+            print(f"🔧 使用文本长度参数: {max_lang_cond_len}")
             _model = RDTRunnerWithFLARE(
                 action_dim=self.args["common"]["state_dim"],
                 pred_horizon=self.args["common"]["action_chunk_size"],
@@ -96,7 +102,7 @@ class RoboticDiffusionTransformerModel(object):
                 lang_token_dim=self.args["model"]["lang_token_dim"],
                 img_token_dim=self.args["model"]["img_token_dim"],
                 state_token_dim=self.args["model"]["state_token_dim"],
-                max_lang_cond_len=self.args["dataset"]["tokenizer_max_length"],
+                max_lang_cond_len=max_lang_cond_len,
                 img_cond_len=img_cond_len,
                 img_pos_embed_config=[
                     # No initial pos embed in the last grid size
@@ -112,7 +118,7 @@ class RoboticDiffusionTransformerModel(object):
                 ],
                 lang_pos_embed_config=[
                     # Similarly, no initial pos embed for language
-                    ("lang", -self.args["dataset"]["tokenizer_max_length"]),
+                    ("lang", -tokenizer_max_length),
                 ],
                 dtype=self.dtype,
             )
