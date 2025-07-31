@@ -447,7 +447,7 @@ class FLAREActivationAligner:
         
         # return loss, info
         """
-        计算对齐损失 - 处理token数量不匹配
+        计算精确的余弦相似度矩阵对齐损失（全局平均）
         
         Args:
             target_tokens: (B, 64, D) SigLIP2生成的目标tokens
@@ -459,7 +459,7 @@ class FLAREActivationAligner:
             info: 额外信息
         """
         # 提取DiT层激活 (B, 32, D)
-        pred_tokens = self.extract_future_token_activations(
+        pred_tokens = self.activation_extractor.extract_future_token_activations(
             layer_idx=self.target_layer,
             horizon=horizon
         )
@@ -469,30 +469,41 @@ class FLAREActivationAligner:
         
         print(f"🔍 对齐shapes: pred={pred_tokens.shape}, target={target_tokens.shape}")
         
-        # 处理token数量不匹配: 32 vs 64
-        if pred_tokens.shape[1] != target_tokens.shape[1]:
-            print(f"🔧 处理token数量不匹配: {pred_tokens.shape[1]} vs {target_tokens.shape[1]}")
-            
-            if pred_tokens.shape[1] < target_tokens.shape[1]:
-                # DiT tokens少，需要从SigLIP2 tokens中采样
-                # 方法1: 平均池化采样
-                target_tokens = F.adaptive_avg_pool1d(
-                    target_tokens.transpose(1, 2),  # (B, D, 64)
-                    pred_tokens.shape[1]            # 采样到32
-                ).transpose(1, 2)                   # (B, 32, D)
-                print(f"   采样目标tokens到: {target_tokens.shape}")
-                
-            else:
-                # SigLIP2 tokens少，扩展DiT tokens（不太可能）
-                pred_tokens = F.adaptive_avg_pool1d(
-                    pred_tokens.transpose(1, 2),
-                    target_tokens.shape[1]
-                ).transpose(1, 2)
-                print(f"   采样预测tokens到: {pred_tokens.shape}")
+        # 🎯 计算余弦相似度矩阵对齐损失
+        loss, cosine_sim_matrix = self._compute_cosine_similarity_matrix_loss(pred_tokens, target_tokens)
         
-        # 处理特征维度不匹配
+        # 额外信息
+        info = {
+            'pred_norm': torch.norm(pred_tokens, dim=-1).mean().item(),
+            'target_norm': torch.norm(target_tokens, dim=-1).mean().item(),
+            'cosine_sim_mean': cosine_sim_matrix.mean().item(),
+            'cosine_sim_max': cosine_sim_matrix.max().item(),
+            'cosine_sim_min': cosine_sim_matrix.min().item(),
+            'pred_shape': list(pred_tokens.shape),
+            'target_shape': list(target_tokens.shape),
+            'sim_matrix_shape': list(cosine_sim_matrix.shape)
+        }
+        
+        print(f"📊 余弦相似度统计: mean={info['cosine_sim_mean']:.4f}, "
+              f"max={info['cosine_sim_max']:.4f}, min={info['cosine_sim_min']:.4f}, loss={loss:.4f}")
+        
+        return loss, info
+    
+    def _compute_cosine_similarity_matrix_loss(self, pred_tokens, target_tokens):
+        """
+        🎯 核心方法：计算余弦相似度矩阵的全局平均损失
+        
+        Args:
+            pred_tokens: (B, 32, D) DiT预测tokens
+            target_tokens: (B, 64, D) SigLIP2目标tokens
+            
+        Returns:
+            loss: 标量损失
+            cosine_sim_matrix: (B, 32, 64) 余弦相似度矩阵
+        """
+        # 🔧 处理特征维度不匹配
         if pred_tokens.shape[2] != target_tokens.shape[2]:
-            print(f"🔧 处理特征维度不匹配: {pred_tokens.shape[2]} vs {target_tokens.shape[2]}")
+            print(f"🔧 维度不匹配，使用适配器: {pred_tokens.shape[2]} vs {target_tokens.shape[2]}")
             if not hasattr(self, 'dim_adapter'):
                 self.dim_adapter = nn.Linear(
                     pred_tokens.shape[2], 
@@ -500,50 +511,45 @@ class FLAREActivationAligner:
                 ).to(pred_tokens.device)
             pred_tokens = self.dim_adapter(pred_tokens)
         
-        # 数值稳定性检查
-        if torch.isnan(pred_tokens).any() or torch.isnan(target_tokens).any():
-            print("⚠️ 检测到NaN值")
-            return torch.tensor(0.0, device=target_tokens.device), {}
+        # 🎯 关键步骤1：L2归一化
+        pred_norm = F.normalize(pred_tokens, p=2, dim=-1)      # (B, 32, D)
+        target_norm = F.normalize(target_tokens, p=2, dim=-1)  # (B, 64, D)
         
-        # 计算FLARE原版对齐损失
-        cosine_sim = F.cosine_similarity(pred_tokens, target_tokens, dim=-1)
-        loss = -cosine_sim.mean()
+        # 🎯 关键步骤2：计算余弦相似度矩阵
+        # (B, 32, D) @ (B, D, 64) -> (B, 32, 64)
+        cosine_sim_matrix = torch.bmm(pred_norm, target_norm.transpose(1, 2))
         
-        # 额外信息
-        info = {
-            'pred_norm': torch.norm(pred_tokens, dim=-1).mean().item(),
-            'target_norm': torch.norm(target_tokens, dim=-1).mean().item(),
-            'cosine_sim': cosine_sim.mean().item(),
-            'pred_shape': list(pred_tokens.shape),
-            'target_shape': list(target_tokens.shape)
-        }
+        # 🎯 关键步骤3：全局平均策略
+        # 对所有32×64=2048个相似度值求平均
+        global_avg_similarity = cosine_sim_matrix.mean()
         
-        print(f"📊 对齐统计: cosine_sim={cosine_sim.mean():.4f}, loss={loss:.4f}")
+        # 🎯 损失计算：负相似度（最大化相似度 = 最小化负相似度）
+        loss = 1 - global_avg_similarity
         
-        return loss, info
+        return loss, cosine_sim_matrix
     
-    def _cosine_contrastive_loss(self, pred_tokens, target_tokens):
-        """余弦对比损失"""
-        # # L2 归一化
-        # pred_norm = F.normalize(pred_tokens, p=2, dim=-1)
-        # target_norm = F.normalize(target_tokens, p=2, dim=-1)
+    # def _cosine_contrastive_loss(self, pred_tokens, target_tokens):
+    #     """余弦对比损失"""
+    #     # # L2 归一化
+    #     # pred_norm = F.normalize(pred_tokens, p=2, dim=-1)
+    #     # target_norm = F.normalize(target_tokens, p=2, dim=-1)
         
-        # batch_size, num_tokens, hidden_dim = pred_norm.shape
+    #     # batch_size, num_tokens, hidden_dim = pred_norm.shape
         
-        # # 计算相似度矩阵
-        # similarity = torch.bmm(pred_norm, target_norm.transpose(1, 2)) / self.alignment_temperature
+    #     # # 计算相似度矩阵
+    #     # similarity = torch.bmm(pred_norm, target_norm.transpose(1, 2)) / self.alignment_temperature
         
-        # # 对角线元素是正样本对
-        # labels = torch.arange(num_tokens, device=similarity.device).unsqueeze(0).expand(batch_size, -1)
+    #     # # 对角线元素是正样本对
+    #     # labels = torch.arange(num_tokens, device=similarity.device).unsqueeze(0).expand(batch_size, -1)
         
-        # # 计算对比损失
-        # loss = F.cross_entropy(similarity.reshape(-1, num_tokens), labels.reshape(-1))
-        cosine_sim = F.cosine_similarity(pred_tokens, target_tokens, dim=-1)
+    #     # # 计算对比损失
+    #     # loss = F.cross_entropy(similarity.reshape(-1, num_tokens), labels.reshape(-1))
+    #     cosine_sim = F.cosine_similarity(pred_tokens, target_tokens, dim=-1)
     
-        # 取负数（最大化相似度 = 最小化负相似度）
-        loss = 1 - cosine_sim.mean()
+    #     # 取负数（最大化相似度 = 最小化负相似度）
+    #     loss = 1 - cosine_sim.mean()
 
-        return loss
+    #     return loss
     
     def _kl_divergence_loss(self, pred_tokens, target_tokens):
         """KL散度损失"""
