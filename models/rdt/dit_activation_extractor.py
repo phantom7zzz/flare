@@ -378,17 +378,88 @@ class FLAREActivationAligner:
         self.loss_history = []
         
     def compute_precise_alignment_loss(self, target_tokens, horizon=32, future_token_indices=None):
-        """
-        计算精确的对齐损失，支持自定义索引
-        """
-        # 使用传入的索引或默认计算
-        if future_token_indices is not None:
-            # 更新激活提取器的索引信息
-            if hasattr(self.activation_extractor, 'sequence_indices'):
-                self.activation_extractor.sequence_indices['future_obs'] = future_token_indices
+        # """
+        # 计算精确的对齐损失，支持自定义索引
+        # """
+        # # 使用传入的索引或默认计算
+        # if future_token_indices is not None:
+        #     # 更新激活提取器的索引信息
+        #     if hasattr(self.activation_extractor, 'sequence_indices'):
+        #         self.activation_extractor.sequence_indices['future_obs'] = future_token_indices
         
-        # 提取DiT层激活
-        pred_tokens = self.activation_extractor.extract_future_token_activations(
+        # # 提取DiT层激活
+        # pred_tokens = self.activation_extractor.extract_future_token_activations(
+        #     layer_idx=self.target_layer,
+        #     horizon=horizon
+        # )
+        
+        # if pred_tokens is None:
+        #     return torch.tensor(0.0, device=target_tokens.device), {}
+        
+        # # 形状检查和修正
+        # if pred_tokens.shape != target_tokens.shape:
+        #     print(f"Shape mismatch: pred {pred_tokens.shape} vs target {target_tokens.shape}")
+            
+        #     # 尝试修正形状不匹配
+        #     if pred_tokens.shape[1] != target_tokens.shape[1]:
+        #         # token数量不匹配，使用插值调整
+        #         pred_tokens = F.adaptive_avg_pool1d(
+        #             pred_tokens.transpose(1, 2),
+        #             target_tokens.shape[1]
+        #         ).transpose(1, 2)
+            
+        #     if pred_tokens.shape[2] != target_tokens.shape[2]:
+        #         # 特征维度不匹配，使用线性投影
+        #         if not hasattr(self, 'dim_adapter'):
+        #             self.dim_adapter = nn.Linear(
+        #                 pred_tokens.shape[2], 
+        #                 target_tokens.shape[2]
+        #             ).to(pred_tokens.device)
+        #         pred_tokens = self.dim_adapter(pred_tokens)
+        
+        # # 数值稳定性检查
+        # if torch.isnan(pred_tokens).any() or torch.isnan(target_tokens).any():
+        #     print("Warning: NaN detected in tokens")
+        #     return torch.tensor(0.0, device=target_tokens.device), {}
+        
+        # # 计算对齐损失
+        # if self.loss_type == "cosine_contrastive":
+        #     loss = self._cosine_contrastive_loss(pred_tokens, target_tokens)
+        # elif self.loss_type == "mse":
+        #     loss = F.mse_loss(pred_tokens, target_tokens)
+        # elif self.loss_type == "kl_div":
+        #     loss = self._kl_divergence_loss(pred_tokens, target_tokens)
+        # else:
+        #     raise ValueError(f"Unknown loss type: {self.loss_type}")
+        
+        # # 额外信息
+        # info = {
+        #     'pred_norm': torch.norm(pred_tokens, dim=-1).mean().item(),
+        #     'target_norm': torch.norm(target_tokens, dim=-1).mean().item(),
+        #     'cosine_sim': F.cosine_similarity(
+        #         pred_tokens.reshape(-1, pred_tokens.shape[-1]),
+        #         target_tokens.reshape(-1, target_tokens.shape[-1]),
+        #         dim=-1
+        #     ).mean().item(),
+        #     'pred_shape': list(pred_tokens.shape),
+        #     'target_shape': list(target_tokens.shape)
+        # }
+        
+        # return loss, info
+        """
+        计算对齐损失 - 处理token数量不匹配
+        
+        Args:
+            target_tokens: (B, 64, D) SigLIP2生成的目标tokens
+            horizon: DiT的horizon
+            future_token_indices: 未来token的索引范围
+            
+        Returns:
+            loss: 对齐损失
+            info: 额外信息
+        """
+        # 提取DiT层激活 (B, 32, D)
+        pred_tokens = self.extract_future_token_activations(
             layer_idx=self.target_layer,
             horizon=horizon
         )
@@ -396,74 +467,82 @@ class FLAREActivationAligner:
         if pred_tokens is None:
             return torch.tensor(0.0, device=target_tokens.device), {}
         
-        # 形状检查和修正
-        if pred_tokens.shape != target_tokens.shape:
-            print(f"Shape mismatch: pred {pred_tokens.shape} vs target {target_tokens.shape}")
+        print(f"🔍 对齐shapes: pred={pred_tokens.shape}, target={target_tokens.shape}")
+        
+        # 处理token数量不匹配: 32 vs 64
+        if pred_tokens.shape[1] != target_tokens.shape[1]:
+            print(f"🔧 处理token数量不匹配: {pred_tokens.shape[1]} vs {target_tokens.shape[1]}")
             
-            # 尝试修正形状不匹配
-            if pred_tokens.shape[1] != target_tokens.shape[1]:
-                # token数量不匹配，使用插值调整
+            if pred_tokens.shape[1] < target_tokens.shape[1]:
+                # DiT tokens少，需要从SigLIP2 tokens中采样
+                # 方法1: 平均池化采样
+                target_tokens = F.adaptive_avg_pool1d(
+                    target_tokens.transpose(1, 2),  # (B, D, 64)
+                    pred_tokens.shape[1]            # 采样到32
+                ).transpose(1, 2)                   # (B, 32, D)
+                print(f"   采样目标tokens到: {target_tokens.shape}")
+                
+            else:
+                # SigLIP2 tokens少，扩展DiT tokens（不太可能）
                 pred_tokens = F.adaptive_avg_pool1d(
                     pred_tokens.transpose(1, 2),
                     target_tokens.shape[1]
                 ).transpose(1, 2)
-            
-            if pred_tokens.shape[2] != target_tokens.shape[2]:
-                # 特征维度不匹配，使用线性投影
-                if not hasattr(self, 'dim_adapter'):
-                    self.dim_adapter = nn.Linear(
-                        pred_tokens.shape[2], 
-                        target_tokens.shape[2]
-                    ).to(pred_tokens.device)
-                pred_tokens = self.dim_adapter(pred_tokens)
+                print(f"   采样预测tokens到: {pred_tokens.shape}")
+        
+        # 处理特征维度不匹配
+        if pred_tokens.shape[2] != target_tokens.shape[2]:
+            print(f"🔧 处理特征维度不匹配: {pred_tokens.shape[2]} vs {target_tokens.shape[2]}")
+            if not hasattr(self, 'dim_adapter'):
+                self.dim_adapter = nn.Linear(
+                    pred_tokens.shape[2], 
+                    target_tokens.shape[2]
+                ).to(pred_tokens.device)
+            pred_tokens = self.dim_adapter(pred_tokens)
         
         # 数值稳定性检查
         if torch.isnan(pred_tokens).any() or torch.isnan(target_tokens).any():
-            print("Warning: NaN detected in tokens")
+            print("⚠️ 检测到NaN值")
             return torch.tensor(0.0, device=target_tokens.device), {}
         
-        # 计算对齐损失
-        if self.loss_type == "cosine_contrastive":
-            loss = self._cosine_contrastive_loss(pred_tokens, target_tokens)
-        elif self.loss_type == "mse":
-            loss = F.mse_loss(pred_tokens, target_tokens)
-        elif self.loss_type == "kl_div":
-            loss = self._kl_divergence_loss(pred_tokens, target_tokens)
-        else:
-            raise ValueError(f"Unknown loss type: {self.loss_type}")
+        # 计算FLARE原版对齐损失
+        cosine_sim = F.cosine_similarity(pred_tokens, target_tokens, dim=-1)
+        loss = -cosine_sim.mean()
         
         # 额外信息
         info = {
             'pred_norm': torch.norm(pred_tokens, dim=-1).mean().item(),
             'target_norm': torch.norm(target_tokens, dim=-1).mean().item(),
-            'cosine_sim': F.cosine_similarity(
-                pred_tokens.reshape(-1, pred_tokens.shape[-1]),
-                target_tokens.reshape(-1, target_tokens.shape[-1]),
-                dim=-1
-            ).mean().item(),
+            'cosine_sim': cosine_sim.mean().item(),
             'pred_shape': list(pred_tokens.shape),
             'target_shape': list(target_tokens.shape)
         }
+        
+        print(f"📊 对齐统计: cosine_sim={cosine_sim.mean():.4f}, loss={loss:.4f}")
         
         return loss, info
     
     def _cosine_contrastive_loss(self, pred_tokens, target_tokens):
         """余弦对比损失"""
-        # L2 归一化
-        pred_norm = F.normalize(pred_tokens, p=2, dim=-1)
-        target_norm = F.normalize(target_tokens, p=2, dim=-1)
+        # # L2 归一化
+        # pred_norm = F.normalize(pred_tokens, p=2, dim=-1)
+        # target_norm = F.normalize(target_tokens, p=2, dim=-1)
         
-        batch_size, num_tokens, hidden_dim = pred_norm.shape
+        # batch_size, num_tokens, hidden_dim = pred_norm.shape
         
-        # 计算相似度矩阵
-        similarity = torch.bmm(pred_norm, target_norm.transpose(1, 2)) / self.alignment_temperature
+        # # 计算相似度矩阵
+        # similarity = torch.bmm(pred_norm, target_norm.transpose(1, 2)) / self.alignment_temperature
         
-        # 对角线元素是正样本对
-        labels = torch.arange(num_tokens, device=similarity.device).unsqueeze(0).expand(batch_size, -1)
+        # # 对角线元素是正样本对
+        # labels = torch.arange(num_tokens, device=similarity.device).unsqueeze(0).expand(batch_size, -1)
         
-        # 计算对比损失
-        loss = F.cross_entropy(similarity.reshape(-1, num_tokens), labels.reshape(-1))
-        
+        # # 计算对比损失
+        # loss = F.cross_entropy(similarity.reshape(-1, num_tokens), labels.reshape(-1))
+        cosine_sim = F.cosine_similarity(pred_tokens, target_tokens, dim=-1)
+    
+        # 取负数（最大化相似度 = 最小化负相似度）
+        loss = 1 - cosine_sim.mean()
+
         return loss
     
     def _kl_divergence_loss(self, pred_tokens, target_tokens):

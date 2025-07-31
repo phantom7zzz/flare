@@ -6,3 +6,4 @@ wandb/*
 !models/
 !data/
 siglip2-large-patch16-256/
+checkpoint_path/
