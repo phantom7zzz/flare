@@ -467,7 +467,6 @@ class FLAREActivationAligner:
         if pred_tokens is None:
             return torch.tensor(0.0, device=target_tokens.device), {}
         
-        print(f"🔍 对齐shapes: pred={pred_tokens.shape}, target={target_tokens.shape}")
         
         # 🎯 计算余弦相似度矩阵对齐损失
         loss, cosine_sim_matrix = self._compute_cosine_similarity_matrix_loss(pred_tokens, target_tokens)
@@ -483,9 +482,6 @@ class FLAREActivationAligner:
             'target_shape': list(target_tokens.shape),
             'sim_matrix_shape': list(cosine_sim_matrix.shape)
         }
-        
-        print(f"📊 余弦相似度统计: mean={info['cosine_sim_mean']:.4f}, "
-              f"max={info['cosine_sim_max']:.4f}, min={info['cosine_sim_min']:.4f}, loss={loss:.4f}")
         
         return loss, info
     

@@ -406,7 +406,7 @@ def parse_args(input_args=None):
     parser.add_argument(
         "--max_text_length",
         type=int,
-        default=32,
+        default=1024,
         help="Maximum text length for FLARE text processing",
     )
 

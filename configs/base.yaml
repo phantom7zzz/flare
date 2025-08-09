@@ -34,7 +34,7 @@ dataset:
   # How to fit the image size
   image_aspect_ratio: pad
   # Maximum number of language tokens
-  tokenizer_max_length: 32
+  tokenizer_max_length: 1024
 
 model:
   # Config for condition adpators

@@ -146,7 +146,7 @@ def train(args, logger):
     current_vision_path = args.pretrained_vision_encoder_name_or_path
     future_vision_path = getattr(args, 'future_vision_encoder_path', './models/siglip2-large-patch16-256')
     future_text_path = getattr(args, 'future_text_encoder_path', None) or future_vision_path
-    max_text_length = getattr(args, 'max_text_length', 32)
+    max_text_length = getattr(args, 'max_text_length', 1024)
     current_vision_image_size = getattr(args, 'current_vision_image_size', 384)
     future_vision_image_size = getattr(args, 'future_vision_image_size', 256)
 

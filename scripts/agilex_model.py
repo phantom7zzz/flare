@@ -91,8 +91,8 @@ class RoboticDiffusionTransformerModel(object):
             img_cond_len = (self.args["common"]["img_history_size"] * self.args["common"]["num_cameras"] *
                             self.vision_model.num_patches)
             # 🔧 使用外部传入的参数，如果没有则使用配置文件的值
-            max_lang_cond_len = 32                      ####手动设置文本编码最大长度
-            tokenizer_max_length = 32                   ####
+            max_lang_cond_len = 1024                      ####手动设置文本编码最大长度
+            tokenizer_max_length = 1024                   ####
             
             print(f"🔧 使用文本长度参数: {max_lang_cond_len}")
             _model = RDTRunnerWithFLARE(

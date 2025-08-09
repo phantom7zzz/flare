@@ -29,7 +29,7 @@ class RDTWithFLARE(nn.Module):
                  hidden_size=1152,
                  depth=28,
                  num_heads=16,
-                 max_lang_cond_len=32,
+                 max_lang_cond_len=1024,
                  img_cond_len=4096,
                  lang_pos_embed_config=None,
                  img_pos_embed_config=None,
@@ -159,6 +159,7 @@ class RDTWithFLARE(nn.Module):
             self.indices[key] = (start_idx, start_idx + length)
             start_idx += length
             
+    
     def _generate_siglip2_targets(self, future_obs_images):
         """使用SigLIP2视觉编码器生成目标tokens"""
         if future_obs_images is None or self.siglip2_model is None:
@@ -169,9 +170,9 @@ class RDTWithFLARE(nn.Module):
         batch_size = future_obs_images.shape[0]
         device = future_obs_images.device
         
-        # 确保图像尺寸是256x256
+        # 确保图像尺寸是256x256，使用更好的插值
         if future_obs_images.shape[-1] != 256:
-            future_obs_images = F.interpolate(future_obs_images, size=(256, 256), mode='bilinear', align_corners=False)
+            future_obs_images = F.interpolate(future_obs_images, size=(256, 256), mode='bilinear', align_corners=False, antialias=True)
         
         # 确保设备和数据类型匹配
         model_device = next(self.siglip2_model.parameters()).device
@@ -190,13 +191,16 @@ class RDTWithFLARE(nn.Module):
             else:
                 features = vision_outputs
             
-            # 调整到目标token数量
-            seq_len = features.shape[1]
-            if seq_len >= self.target_tokens:
-                features = features[:, :self.target_tokens, :]
-            else:
-                repeat_times = (self.target_tokens + seq_len - 1) // seq_len
-                features = features.repeat(1, repeat_times, 1)[:, :self.target_tokens, :]
+            # 将256个token通过2x2平均池化减少到64个token
+            hidden_size = features.shape[-1]
+            # 重塑为(batch, 16, 16, hidden_size)用于2D池化
+            features = features.view(batch_size, 16, 16, hidden_size)
+            # 转换为(batch, hidden_size, 16, 16)
+            features = features.permute(0, 3, 1, 2)
+            # 2x2平均池化，输出为(batch, hidden_size, 8, 8)
+            features = F.avg_pool2d(features, kernel_size=2, stride=2)
+            # 转换回(batch, 64, hidden_size)
+            features = features.permute(0, 2, 3, 1).contiguous().view(batch_size, 64, hidden_size)
             
             # 维度适配
             target_tokens = self.siglip2_adapter(features.to(self.dtype))
@@ -340,7 +344,7 @@ class RDTWithFLARE(nn.Module):
         target_future_tokens = None
         if return_alignment_loss and future_obs_image is not None:
             target_future_tokens = self._generate_siglip2_targets(future_obs_image)
-            print(f"🎯 SigLIP2目标tokens: {target_future_tokens.shape}")
+            
 
         # 8. 通过transformer blocks
         for i, block in enumerate(self.blocks):
@@ -367,7 +371,7 @@ class RDTWithFLARE(nn.Module):
                 horizon=self.horizon,
                 future_token_indices=(future_start_idx, future_end_idx)
             )
-            print(f"✅ 对齐损失: {alignment_loss.item():.4f}")
+            
         
         if return_alignment_loss:
             return action_tokens, alignment_loss
