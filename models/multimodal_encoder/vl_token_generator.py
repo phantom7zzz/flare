@@ -83,7 +83,7 @@ class VLTokenGenerator(nn.Module):
                  num_fusion_layers=4,
                  num_heads=8,
                  dropout=0.1,
-                 max_text_length=32,
+                 max_text_length=1024,
                  image_size=256,
                  device="cuda",
                  torch_dtype=torch.float16,
@@ -98,7 +98,7 @@ class VLTokenGenerator(nn.Module):
         self.t5_embed_dim = t5_embed_dim
         self.image_size = image_size
         self.device = device
-        self.max_text_length = 32
+        self.max_text_length = 1024
         print("🎯 初始化统一T5架构的VLTokenGenerator")
         print(f"   隐藏层大小: {hidden_size}")
         print(f"   T5嵌入维度: {t5_embed_dim}")

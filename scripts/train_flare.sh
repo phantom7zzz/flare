@@ -91,7 +91,7 @@ accelerate launch --main_process_port=28499 main.py \
     --future_vision_encoder_path /home/deng_xiang/qian_daichao/RoboTwin/policy/RDT_flare/siglip2-large-patch16-256 \
     --current_vision_image_size 384 \
     --future_vision_image_size 256 \
-    --max_text_length 32 \
+    --max_text_length 1024 \
     --output_dir=$OUTPUT_DIR \
     --train_batch_size=$TRAIN_BATCH_SIZE \
     --sample_batch_size=$SAMPLE_BATCH_SIZE \

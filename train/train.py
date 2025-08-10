@@ -320,11 +320,41 @@ def train(args, logger):
         #         logger.warning(f"⚠️  预训练权重加载失败，使用随机初始化: {e}")
         # else:
         #     logger.info("使用目录路径，跳过权重加载")
+        # if os.path.isfile(pretrained_path):
+        #     try:
+        #         logger.info(f"加载预训练权重: {pretrained_path}")
+        #         ckpt = torch.load(pretrained_path, map_location="cpu")
+        #         # 支持多种 checkpoint 格式
+        #         if isinstance(ckpt, dict) and "module" in ckpt:
+        #             state_dict = ckpt["module"]
+        #         elif isinstance(ckpt, dict) and "state_dict" in ckpt:
+        #             state_dict = ckpt["state_dict"]
+        #         else:
+        #             state_dict = ckpt
+
+        #         # 过滤掉形状不匹配的参数
+        #         model_sd = rdt.state_dict()
+        #         filtered_sd = {}
+        #         for k, v in state_dict.items():
+        #             if k in model_sd and v.shape == model_sd[k].shape:
+        #                 filtered_sd[k] = v
+        #             else:
+        #                 logger.warning(
+        #                     f"跳过 {k}: checkpoint {tuple(v.shape)} vs model {tuple(model_sd.get(k, v).shape)}"
+        #                 )
+
+        #         # 增量加载匹配的参数，其余保持随机初始化
+        #         rdt.load_state_dict(filtered_sd, strict=False)
+        #         logger.info("✅ 预训练权重加载成功（已加载所有 shape 匹配的参数，其余随机初始化）")
+        #     except Exception as e:
+        #         logger.warning(f"⚠️  预训练权重加载失败，使用随机初始化: {e}")
+        # else:
+        #     logger.info("使用目录路径，跳过权重加载")
         if os.path.isfile(pretrained_path):
             try:
                 logger.info(f"加载预训练权重: {pretrained_path}")
                 ckpt = torch.load(pretrained_path, map_location="cpu")
-                # 支持多种 checkpoint 格式
+                
                 if isinstance(ckpt, dict) and "module" in ckpt:
                     state_dict = ckpt["module"]
                 elif isinstance(ckpt, dict) and "state_dict" in ckpt:
@@ -332,22 +362,52 @@ def train(args, logger):
                 else:
                     state_dict = ckpt
 
-                # 过滤掉形状不匹配的参数
                 model_sd = rdt.state_dict()
                 filtered_sd = {}
+                
                 for k, v in state_dict.items():
-                    if k in model_sd and v.shape == model_sd[k].shape:
-                        filtered_sd[k] = v
+                    if k in model_sd:
+                        model_shape = model_sd[k].shape
+                        checkpoint_shape = v.shape
+                        
+                        # 🎯 特殊处理 x_pos_embed
+                        if k == "model.x_pos_embed" and len(model_shape) == 3:
+                            model_seq_len = model_shape[1]  # 99
+                            checkpoint_seq_len = checkpoint_shape[1]  # 67
+                            
+                            if model_seq_len > checkpoint_seq_len:
+                                logger.info(f"🔧 扩展 {k}: {checkpoint_shape} -> {model_shape}")
+                                
+                                # 创建新的位置编码
+                                extended_pos_embed = torch.zeros(model_shape, dtype=v.dtype)
+                                
+                                # 复制前67个位置
+                                extended_pos_embed[:, :checkpoint_seq_len, :] = v
+                                
+                                # 后32个位置随机初始化
+                                new_positions = model_seq_len - checkpoint_seq_len
+                                extended_pos_embed[:, checkpoint_seq_len:, :] = torch.randn(
+                                    1, new_positions, model_shape[2]
+                                ) * 0.02
+                                
+                                filtered_sd[k] = extended_pos_embed
+                                logger.info(f"   ✅ 保留前{checkpoint_seq_len}个位置，随机初始化后{new_positions}个位置")
+                                
+                            else:
+                                filtered_sd[k] = v
+                                
+                        elif v.shape == model_shape:
+                            filtered_sd[k] = v
+                        else:
+                            logger.warning(f"跳过 {k}: checkpoint {checkpoint_shape} vs model {model_shape}")
                     else:
-                        logger.warning(
-                            f"跳过 {k}: checkpoint {tuple(v.shape)} vs model {tuple(model_sd.get(k, v).shape)}"
-                        )
+                        logger.warning(f"跳过未知参数: {k}")
 
-                # 增量加载匹配的参数，其余保持随机初始化
                 rdt.load_state_dict(filtered_sd, strict=False)
-                logger.info("✅ 预训练权重加载成功（已加载所有 shape 匹配的参数，其余随机初始化）")
+                logger.info("✅ 预训练权重加载成功（位置编码智能扩展）")
+                
             except Exception as e:
-                logger.warning(f"⚠️  预训练权重加载失败，使用随机初始化: {e}")
+                logger.warning(f"⚠️ 预训练权重加载失败，使用随机初始化: {e}")
         else:
             logger.info("使用目录路径，跳过权重加载")
             
@@ -736,14 +796,6 @@ def train(args, logger):
                         # 使用T5嵌入路径给FLARE（统一T5架构）
                         text_instructions = batch.get("flare_text_embed_paths", [])
                         
-                        # 调试信息
-                        if global_step % 100 == 0:  # 每100步打印一次
-                            print(f"🎯 统一T5架构 - Step {global_step}:")
-                            print(f"   FLARE使用T5嵌入路径: {len(text_instructions)} 个文件")
-                            if text_instructions:
-                                print(f"   示例路径: {text_instructions[0]}")
-                            else:
-                                print("   ⚠️ 未获取到T5嵌入路径")
                     else:
                         # 使用原始文本字符串
                         text_instructions = batch.get("text_instructions", [""] * len(images))

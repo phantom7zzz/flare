@@ -25,7 +25,7 @@ class RDTWithFLARE(nn.Module):
 
     def __init__(self,
                  output_dim=128,
-                 horizon=32,
+                 horizon=64,
                  hidden_size=1152,
                  depth=28,
                  num_heads=16,

@@ -95,7 +95,7 @@ class DiTActivationExtractor:
         
     def _compute_default_indices(self, model):
         """为旧版本模型计算默认索引"""
-        horizon = getattr(model, 'horizon', 32)
+        horizon = getattr(model, 'horizon', 64)
         num_future_tokens = getattr(model, 'num_future_tokens', 32)
         
         indices = {
@@ -200,7 +200,7 @@ class DiTActivationExtractor:
             future_start, future_end = self.sequence_indices['future_obs']
         else:
             # 兜底方案：使用传统计算
-            future_start = self.token_start_offset + kwargs.get('horizon', 32)
+            future_start = self.token_start_offset + kwargs.get('horizon', 64)
             future_end = future_start + self.num_future_tokens
         
         # 边界检查
@@ -377,7 +377,7 @@ class FLAREActivationAligner:
         self.activation_history = []
         self.loss_history = []
         
-    def compute_precise_alignment_loss(self, target_tokens, horizon=32, future_token_indices=None):
+    def compute_precise_alignment_loss(self, target_tokens, horizon=64, future_token_indices=None):
         # """
         # 计算精确的对齐损失，支持自定义索引
         # """
@@ -469,60 +469,105 @@ class FLAREActivationAligner:
         
         
         # 🎯 计算余弦相似度矩阵对齐损失
-        loss, cosine_sim_matrix = self._compute_cosine_similarity_matrix_loss(pred_tokens, target_tokens)
-        
-        # 额外信息
-        info = {
-            'pred_norm': torch.norm(pred_tokens, dim=-1).mean().item(),
-            'target_norm': torch.norm(target_tokens, dim=-1).mean().item(),
-            'cosine_sim_mean': cosine_sim_matrix.mean().item(),
-            'cosine_sim_max': cosine_sim_matrix.max().item(),
-            'cosine_sim_min': cosine_sim_matrix.min().item(),
-            'pred_shape': list(pred_tokens.shape),
-            'target_shape': list(target_tokens.shape),
-            'sim_matrix_shape': list(cosine_sim_matrix.shape)
-        }
+        loss, info = self._compute_cosine_similarity_matrix_loss(pred_tokens, target_tokens)
         
         return loss, info
     
+    # def _compute_cosine_similarity_matrix_loss(self, pred_tokens, target_tokens):
+    #     """
+    #     🎯 核心方法：计算余弦相似度矩阵的全局平均损失
+        
+    #     Args:
+    #         pred_tokens: (B, 32, D) DiT预测tokens
+    #         target_tokens: (B, 64, D) SigLIP2目标tokens
+            
+    #     Returns:
+    #         loss: 标量损失
+    #         cosine_sim_matrix: (B, 32, 64) 余弦相似度矩阵
+    #     """
+    #     # 🔧 处理特征维度不匹配
+    #     if pred_tokens.shape[2] != target_tokens.shape[2]:
+    #         print(f"🔧 维度不匹配，使用适配器: {pred_tokens.shape[2]} vs {target_tokens.shape[2]}")
+    #         if not hasattr(self, 'dim_adapter'):
+    #             self.dim_adapter = nn.Linear(
+    #                 pred_tokens.shape[2], 
+    #                 target_tokens.shape[2]
+    #             ).to(pred_tokens.device)
+    #         pred_tokens = self.dim_adapter(pred_tokens)
+        
+    #     # 🎯 关键步骤1：L2归一化
+    #     pred_norm = F.normalize(pred_tokens, p=2, dim=-1)      # (B, 32, D)
+    #     target_norm = F.normalize(target_tokens, p=2, dim=-1)  # (B, 64, D)
+        
+    #     # 🎯 关键步骤2：计算余弦相似度矩阵
+    #     # (B, 32, D) @ (B, D, 64) -> (B, 32, 64)
+    #     cosine_sim_matrix = torch.bmm(pred_norm, target_norm.transpose(1, 2))
+        
+    #     # 🎯 关键步骤3：全局平均策略
+    #     # 对所有32×64=2048个相似度值求平均
+    #     global_avg_similarity = cosine_sim_matrix.mean()
+        
+    #     # 🎯 损失计算：负相似度（最大化相似度 = 最小化负相似度）
+    #     loss = 1 - global_avg_similarity
+        
+    #     return loss, cosine_sim_matrix
     def _compute_cosine_similarity_matrix_loss(self, pred_tokens, target_tokens):
         """
-        🎯 核心方法：计算余弦相似度矩阵的全局平均损失
-        
-        Args:
-            pred_tokens: (B, 32, D) DiT预测tokens
-            target_tokens: (B, 64, D) SigLIP2目标tokens
-            
-        Returns:
-            loss: 标量损失
-            cosine_sim_matrix: (B, 32, 64) 余弦相似度矩阵
+        结构化空间对齐：基于空间位置的有意义对应
         """
-        # 🔧 处理特征维度不匹配
-        if pred_tokens.shape[2] != target_tokens.shape[2]:
-            print(f"🔧 维度不匹配，使用适配器: {pred_tokens.shape[2]} vs {target_tokens.shape[2]}")
-            if not hasattr(self, 'dim_adapter'):
-                self.dim_adapter = nn.Linear(
-                    pred_tokens.shape[2], 
-                    target_tokens.shape[2]
-                ).to(pred_tokens.device)
-            pred_tokens = self.dim_adapter(pred_tokens)
+        batch_size, pred_len, hidden_dim = pred_tokens.shape
+        target_len = target_tokens.shape[1]
         
-        # 🎯 关键步骤1：L2归一化
-        pred_norm = F.normalize(pred_tokens, p=2, dim=-1)      # (B, 32, D)
-        target_norm = F.normalize(target_tokens, p=2, dim=-1)  # (B, 64, D)
+        print(f"🔧 结构化对齐: pred={pred_tokens.shape}, target={target_tokens.shape}")
         
-        # 🎯 关键步骤2：计算余弦相似度矩阵
-        # (B, 32, D) @ (B, D, 64) -> (B, 32, 64)
-        cosine_sim_matrix = torch.bmm(pred_norm, target_norm.transpose(1, 2))
+        # 🎯 建立空间结构映射
+        if pred_len == 32 and target_len == 64:
+            # 32个pred tokens按4×8空间结构排列
+            pred_spatial = pred_tokens.view(batch_size, 4, 8, hidden_dim)
+            
+            # 64个target tokens按8×8空间结构排列
+            target_spatial = target_tokens.view(batch_size, 8, 8, hidden_dim)
+            
+            # 通过2×1池化将8×8降采样到4×8
+            target_for_pooling = target_spatial.permute(0, 3, 1, 2)  # (B, D, 8, 8)
+            target_aligned = F.avg_pool2d(
+                target_for_pooling, 
+                kernel_size=(2, 1),  # 高度2:1池化，宽度保持
+                stride=(2, 1)
+            )  # (B, D, 4, 8)
+            target_aligned = target_aligned.permute(0, 2, 3, 1)  # (B, 4, 8, D)
+            
+            # 展平为一对一对应
+            pred_flat = pred_spatial.view(batch_size, 32, hidden_dim)
+            target_flat = target_aligned.view(batch_size, 32, hidden_dim)
+            
+            print(f"✅ 空间对齐: pred(4×8), target_aligned(4×8)")
+            
+        else:
+            # 兜底方案
+            print(f"⚠️ 维度不匹配，使用自适应对齐")
+            target_flat = F.adaptive_avg_pool1d(
+                target_tokens.transpose(1, 2), pred_len
+            ).transpose(1, 2)
+            pred_flat = pred_tokens
         
-        # 🎯 关键步骤3：全局平均策略
-        # 对所有32×64=2048个相似度值求平均
-        global_avg_similarity = cosine_sim_matrix.mean()
+        # 🎯 一对一余弦相似度计算
+        pred_norm = F.normalize(pred_flat, p=2, dim=-1)
+        target_norm = F.normalize(target_flat, p=2, dim=-1)
         
-        # 🎯 损失计算：负相似度（最大化相似度 = 最小化负相似度）
-        loss = 1 - global_avg_similarity
+        cosine_sim = F.cosine_similarity(pred_norm, target_norm, dim=-1)  # (B, 32)
+        loss = 1 - cosine_sim.mean()
         
-        return loss, cosine_sim_matrix
+        info = {
+            'cosine_sim_mean': cosine_sim.mean().item(),
+            'cosine_sim_std': cosine_sim.std().item(),
+            'alignment_type': 'structured_spatial',
+            'spatial_dims': '4x8_to_4x8'
+        }
+        
+        print(f"🎯 对齐损失: {loss.item():.6f}, 平均相似度: {cosine_sim.mean().item():.6f}")
+        
+        return loss, info
     
     # def _cosine_contrastive_loss(self, pred_tokens, target_tokens):
     #     """余弦对比损失"""
